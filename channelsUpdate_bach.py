@@ -88,7 +88,7 @@ def save_to_db(values):
 
 def run_batch():
     headers = {"X-APIKEY": API_KEY}
-    exclude_keywords = ['clip', '클립', '切抜き', '切り抜き', 'fan', 'archive', '다시보기', 'vod', 'replay', '公式']
+    exclude_keywords = ['clip', '클립', '切抜き', '切り抜き', 'fan', 'archive', '다시보기', 'vod', 'replay']
     
     try:
         existing_data = get_existing_data()

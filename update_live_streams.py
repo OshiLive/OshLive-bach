@@ -16,7 +16,6 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT")
 }
 
-# --- 로깅 설정 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -26,8 +25,54 @@ logging.basicConfig(
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
+def fetch_and_register_channel(cur, channel_id):
+    """테이블 정의(oshilive.channels)에 맞춰 신규 채널 등록"""
+    url = f"https://holodex.net/api/v2/channels/{channel_id}"
+    headers = {"X-APIKEY": API_KEY}
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            c = resp.json()
+            
+            # 테이블 정의서의 컬럼명과 정확히 매칭 (profile_img_url, banner_img_url, twitter_id 등)
+            query = """
+                INSERT INTO oshilive.channels (
+                    channel_id, name, english_name, org, 
+                    profile_img_url, banner_img_url, description, 
+                    twitter_id, lang, subscriber_count, video_count,
+                    updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (channel_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    profile_img_url = EXCLUDED.profile_img_url,
+                    banner_img_url = EXCLUDED.banner_img_url,
+                    subscriber_count = EXCLUDED.subscriber_count,
+                    updated_at = CURRENT_TIMESTAMP;
+            """
+            
+            # Holodex API 응답값과 DB 컬럼 매핑
+            cur.execute(query, (
+                c['id'], 
+                c['name'], 
+                c.get('english_name'), 
+                c.get('org'),
+                c.get('photo'),        # Holodex의 photo -> profile_img_url
+                c.get('banner'),       # Holodex의 banner -> banner_img_url
+                c.get('description'),
+                c.get('twitter'),      # Holodex의 twitter -> twitter_id
+                c.get('lang'),
+                c.get('subscriber_count', 0),
+                c.get('video_count', 0)
+            ))
+            logging.info(f"✨ 신규 채널 정식 등록 완료: {c['name']} ({channel_id})")
+        else:
+            logging.error(f"❌ 채널 정보 조회 실패 ({channel_id}): {resp.status_code}")
+    except Exception as e:
+        logging.error(f"❌ 채널 등록 중 오류: {e}")
+
 def fetch_live_streams():
-    """Holodex API에서 현재 라이브 및 예정된 모든 방송 목록을 가져옵니다."""
+    """Holodex API에서 현재 라이브 및 예정된 방송 목록 페이징 수집"""
     url = "https://holodex.net/api/v2/live"
     all_streams = []
     offset = 0
@@ -39,7 +84,7 @@ def fetch_live_streams():
             "type": "stream",
             "limit": limit,
             "offset": offset,
-            "org": "Hololive" # 테스트 중에는 특정 그룹을 지정하는 게 안전합니다. 전체를 보려면 이 줄을 삭제하세요.
+            "org": "Hololive"  # 필요한 경우 수정/삭제 가능
         }
         headers = {"X-APIKEY": API_KEY}
         
@@ -47,16 +92,10 @@ def fetch_live_streams():
             resp = requests.get(url, headers=headers, params=params, timeout=20)
             if resp.status_code == 200:
                 data = resp.json()
-                if not data: # 더 이상 가져올 데이터가 없으면 루프 종료
-                    break
+                if not data: break
                 all_streams.extend(data)
-                logging.info(f"📡 데이터 수집 중... (현재까지 {len(all_streams)}개)")
-                
-                # 만약 가져온 데이터가 limit보다 적으면 다음 페이지가 없다는 뜻
-                if len(data) < limit:
-                    break
-                
-                offset += limit # 다음 페이지로 이동
+                if len(data) < limit: break
+                offset += limit
             else:
                 logging.error(f"❌ API 호출 실패: {resp.status_code}")
                 break
@@ -75,59 +114,60 @@ def update_streams_db(streams):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # 1. 데이터 가공 (총 10개 필드)
-    values = []
-    for s in streams:
-        values.append((
-            s['id'],
-            s['channel']['id'],
-            s['title'],
-            s.get('topic_id'),
-            s['status'],
-            s.get('start_scheduled'),
-            s.get('start_actual'),
-            s.get('end_actual'),
-            f"https://i.ytimg.com/vi/{s['id']}/maxresdefault.jpg",
-            s.get('live_viewers', 0)
-        ))
-
-    # 2. Upsert 쿼리 (INSERT 컬럼 10개와 VALUES 10개 일치시킴)
-    upsert_query = """
-    INSERT INTO oshilive.streams (
-        stream_id, channel_id, title, topic_id, status, 
-        start_scheduled, start_actual, end_actual, 
-        thumbnail_url, current_viewers
-    ) VALUES %s
-    ON CONFLICT (stream_id) DO UPDATE SET
-        title = EXCLUDED.title,
-        topic_id = EXCLUDED.topic_id,
-        status = EXCLUDED.status,
-        start_actual = COALESCE(EXCLUDED.start_actual, oshilive.streams.start_actual),
-        end_actual = EXCLUDED.end_actual,
-        current_viewers = EXCLUDED.current_viewers,
-        thumbnail_url = EXCLUDED.thumbnail_url,
-        updated_at = CURRENT_TIMESTAMP;
-    """
-
     try:
-        # 데이터 삽입/업데이트
+        # --- [핵심 추가] FK 에러 방지용 사전 채널 체크 로직 ---
+        stream_channel_ids = list(set([s['channel']['id'] for s in streams]))
+        
+        # 현재 DB에 있는 채널 조회
+        cur.execute("SELECT channel_id FROM oshilive.channels WHERE channel_id = ANY(%s)", (stream_channel_ids,))
+        existing_ids = {r[0] for r in cur.fetchall()}
+        
+        # 없는 채널들만 골라서 정식 등록 진행
+        missing_ids = [c_id for c_id in stream_channel_ids if c_id not in existing_ids]
+        for m_id in missing_ids:
+            fetch_and_register_channel(cur, m_id)
+        
+        # 커밋하여 채널들을 확정 (이후 streams INSERT를 위해)
+        conn.commit() 
+        # --------------------------------------------------
+
+        # 1. 데이터 가공
+        values = []
+        for s in streams:
+            values.append((
+                s['id'], s['channel']['id'], s['title'], s.get('topic_id'), s['status'],
+                s.get('start_scheduled'), s.get('start_actual'), s.get('end_actual'),
+                f"https://i.ytimg.com/vi/{s['id']}/maxresdefault.jpg",
+                s.get('live_viewers', 0)
+            ))
+
+        # 2. Streams Upsert
+        upsert_query = """
+        INSERT INTO oshilive.streams (
+            stream_id, channel_id, title, topic_id, status, 
+            start_scheduled, start_actual, end_actual, thumbnail_url, current_viewers
+        ) VALUES %s
+        ON CONFLICT (stream_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            topic_id = EXCLUDED.topic_id,
+            status = EXCLUDED.status,
+            start_actual = COALESCE(EXCLUDED.start_actual, oshilive.streams.start_actual),
+            end_actual = EXCLUDED.end_actual,
+            current_viewers = EXCLUDED.current_viewers,
+            thumbnail_url = EXCLUDED.thumbnail_url,
+            updated_at = CURRENT_TIMESTAMP;
+        """
         execute_values(cur, upsert_query, values)
-        conn.commit()
-        logging.info(f"✅ {len(values)}개의 스트림 DB 저장 완료")
         
-        # 3. 종료된 방송 처리 (Cleanup)
-        # 현재 API 응답에 없는 stream_id 중 DB에 live/upcoming인 놈들을 past로 변경
+        # 3. 종료된 방송 처리
         active_ids = [s['id'] for s in streams]
-        
         cur.execute("""
-            UPDATE oshilive.streams 
-            SET status = 'past', updated_at = CURRENT_TIMESTAMP
-            WHERE status IN ('live', 'upcoming') 
-              AND NOT (stream_id = ANY(%s));
+            UPDATE oshilive.streams SET status = 'past', updated_at = CURRENT_TIMESTAMP
+            WHERE status IN ('live', 'upcoming') AND NOT (stream_id = ANY(%s));
         """, (active_ids,))
         
         conn.commit()
-        logging.info("🧹 종료된 방송 상태 갱신 완료")
+        logging.info(f"✅ {len(values)}개의 스트림 업데이트 및 종료 처리 완료")
 
     except Exception as e:
         conn.rollback()
