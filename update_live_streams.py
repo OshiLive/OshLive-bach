@@ -98,6 +98,7 @@ def update_streams():
             # 4. 스트림 데이터 가공 및 UPSERT
             stream_values = []
             collab_values = []
+            stats_values = []
             active_ids = [s['id'] for s in streams]
 
             for s in streams:
@@ -107,8 +108,12 @@ def update_streams():
                     f"https://i.ytimg.com/vi/{s['id']}/maxresdefault.jpg",
                     s.get('live_viewers', 0)
                 ))
+                #합방 데이터
                 if s.get('mentions'):
                     for m in s['mentions']: collab_values.append((s['id'], m['id']))
+                #시청자 수 수집
+                if s.get('status') == 'live':
+                    stats_values.append((s['id'], s.get('live_viewers', 0)))
 
             upsert_query = """
                 INSERT INTO oshilive.streams (
@@ -125,8 +130,14 @@ def update_streams():
             """
             execute_values(cur, upsert_query, stream_values)
 
+            # 합방 INSERT
             if collab_values:
                 execute_values(cur, "INSERT INTO oshilive.stream_collabs VALUES %s ON CONFLICT DO NOTHING", collab_values)
+
+            # 시청자수 INSERT
+            if stats_values:
+                execute_values(cur, "INSERT INTO oshilive.stream_stats (stream_id, viewer_count) VALUES %s", stats_values)
+
 
             # 5. 종료 상태 업데이트
             cur.execute("""
