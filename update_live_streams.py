@@ -178,8 +178,8 @@ def update_streams():
                 logging.info(f" └─ 하이라이트 대기열 {len(queue_values)}건 등록 완료")
 
 
-                conn.commit()
-                logging.info(f"배치 완료: 방송 {len(stream_values)}개, 통계 {len(stats_values)}건 갱신")
+            conn.commit()
+            logging.info(f"배치 완료: 방송 {len(stream_values)}개, 통계 {len(stats_values)}건 갱신")
 
         except Exception as e:
             conn.rollback()

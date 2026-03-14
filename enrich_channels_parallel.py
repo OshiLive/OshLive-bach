@@ -45,7 +45,8 @@ def get_target_channels(only_missing_info=False):
             query = """
                 SELECT channel_id, name, subscriber_count, video_count 
                 FROM oshilive.channels 
-                WHERE banner_img_url IS NULL OR top_topics IS NULL;
+                WHERE (banner_img_url IS NULL OR top_topics IS NULL)
+                AND created_at = updated_at;
             """
         else:
             query = "SELECT channel_id, name, subscriber_count, video_count FROM oshilive.channels;"
