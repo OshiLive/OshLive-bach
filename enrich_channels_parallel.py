@@ -31,23 +31,36 @@ def get_db_connection():
            f"port={DB_CONFIG['port']} options='-c client_encoding=utf8'")
     return psycopg2.connect(dsn)
 
-def get_target_channels():
+def get_target_channels(only_missing_info=False):
+    """
+    only_missing_info=True: (1분 배치용) 빈칸이 있는 신규 채널만 가져옴
+    only_missing_info=False: (자정 배치용) 구독자 갱신을 위해 모든 채널을 가져옴
+    """
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # 데이터가 비어있는 채널 추출
-        query = "SELECT channel_id FROM oshilive.channels WHERE banner_img_url IS NULL OR top_topics IS NULL;"
+        
+        if only_missing_info:
+            query = """
+                SELECT channel_id, name, subscriber_count, video_count 
+                FROM oshilive.channels 
+                WHERE banner_img_url IS NULL OR top_topics IS NULL;
+            """
+        else:
+            query = "SELECT channel_id, name, subscriber_count, video_count FROM oshilive.channels;"
+            
         cur.execute(query)
-        return [row[0] for row in rows] if (rows := cur.fetchall()) else []
+        return cur.fetchall() 
     finally:
         if conn: conn.close()
 
-def enrich_channel_data(channel_id):
-    """
-    이 함수는 각 스레드에서 실행됩니다. 
-    호출될 때마다 DB 연결을 맺으므로 max_workers 관리가 필수입니다.
-    """
+def enrich_channel_data(target_data):
+    # 전달받은 기존 DB 데이터 언패킹 (구독자 변동 로그용)
+    channel_id, ch_name, old_subs, old_vids = target_data
+    old_subs = old_subs or 0
+    old_vids = old_vids or 0
+
     headers = {"X-APIKEY": API_KEY}
     url = f"https://holodex.net/api/v2/channels/{channel_id}"
     
@@ -56,9 +69,9 @@ def enrich_channel_data(channel_id):
         remaining = resp.headers.get('X-RateLimit-Remaining', 'unknown')
         
         if resp.status_code == 429:
-            return f"🚫 {channel_id} 한도 초과!"
+            return f"🚫 {ch_name} 한도 초과!"
         if resp.status_code != 200:
-            return f"⚠️ {channel_id} 실패 ({resp.status_code})"
+            return f"⚠️ {ch_name} 실패 ({resp.status_code})"
             
         data = resp.json()
         
@@ -69,50 +82,69 @@ def enrich_channel_data(channel_id):
         
         group_list = [g for g in [data.get('group'), data.get('suborg')] if g]
         unique_groups = list(set(group_list)) if group_list else None
+        
+        # 새로운 구독자 수와 영상 수 추출
+        new_subs = data.get('subscriber_count') or old_subs
+        new_vids = data.get('video_count') or old_vids
+
+        # 기존 값과 비교하여 변동이 있으면 로그 출력
+        if old_subs != new_subs or old_vids != new_vids:
+            sub_diff = new_subs - old_subs
+            vid_diff = new_vids - old_vids
+            logging.info(
+                f"📈 [{ch_name}] 정보 갱신: "
+                f"구독자 {old_subs:,} ➔ {new_subs:,} ({sub_diff:+d}), "
+                f"영상 {old_vids:,} ➔ {new_vids:,} ({vid_diff:+d})"
+            )
 
         # --- DB 업데이트 작업 ---
         update_query = """
         UPDATE oshilive.channels SET
             banner_img_url = %s, total_view_count = %s, yt_handle = %s,
             sub_groups = %s, top_topics = %s, description = %s, 
-            lang = %s, published_at = %s, updated_at = CURRENT_TIMESTAMP
+            lang = %s, published_at = %s, 
+            subscriber_count = %s, video_count = %s,
+            updated_at = CURRENT_TIMESTAMP
         WHERE channel_id = %s;
         """
         
         conn = None
         try:
-            conn = get_db_connection() # 스레드마다 새로운 커넥션 생성
+            conn = get_db_connection()
             cur = conn.cursor()
             cur.execute(update_query, (
                 banner, views, handle, unique_groups, data.get('top_topics'), 
-                data.get('description'), data.get('lang'), 
-                data.get('published_at'), channel_id
+                data.get('description'), data.get('lang'), data.get('published_at'), 
+                new_subs, new_vids, channel_id
             ))
             conn.commit()
         finally:
-            if conn: conn.close() # 작업 즉시 반납 (매우 중요)
+            if conn: conn.close()
         
-        return f"✅ {data.get('name')} 완료 (잔여: {remaining})"
+        return f"✅ {ch_name} 완료 (잔여: {remaining})"
 
     except Exception as e:
-        return f"❌ {channel_id} 에러: {str(e)}"
+        return f"❌ {ch_name} 에러: {str(e)}"
 
-def run_full_parallel_enrichment():
-    targets = get_target_channels()
+def run_full_parallel_enrichment(only_missing_info=False):
+    targets = get_target_channels(only_missing_info)
     if not targets:
         logging.info("✨ 보충할 데이터가 없습니다.")
         return
 
     SAFE_WORKERS = 7
-    logging.info(f"🚀 총 {len(targets)}개 채널 병렬 보충 시작 (안전 모드 Worker: {SAFE_WORKERS})")
+    mode_text = "빈칸 보충" if only_missing_info else "전체 갱신"
+    logging.info(f"🚀 총 {len(targets)}개 채널 병렬 {mode_text} 시작 (안전 모드 Worker: {SAFE_WORKERS})")
 
     with ThreadPoolExecutor(max_workers=SAFE_WORKERS) as executor:
-        future_to_id = {executor.submit(enrich_channel_data, c_id): c_id for c_id in targets}
+        # target이 (id, name, subs, vids) 튜플이므로 전체를 넘깁니다.
+        future_to_id = {executor.submit(enrich_channel_data, target): target[0] for target in targets}
         
         for count, future in enumerate(as_completed(future_to_id), 1):
             logging.info(f"[{count}/{len(targets)}] {future.result()}")
 
-    logging.info("🏁 모든 보충이 완료되었습니다!")
+    logging.info(f"🏁 모든 {mode_text} 작업이 완료되었습니다!")
 
 if __name__ == "__main__":
-    run_full_parallel_enrichment()
+    # 단독으로 실행할 때는 모든 채널의 구독자 수를 갱신합니다.
+    run_full_parallel_enrichment(only_missing_info=False)
