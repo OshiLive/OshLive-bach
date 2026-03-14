@@ -190,7 +190,7 @@ def update_streams():
             logging.info("DB 커넥션 반납 완료")
 
         logging.info("신규채널 상세정보 업데이트")
-        run_full_parallel_enrichment()
+        run_full_parallel_enrichment(only_missing_info=True)
 
     except Exception as e:
         logging.error(f"배치 실행 중 에러: {e}")
