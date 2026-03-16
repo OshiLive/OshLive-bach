@@ -141,7 +141,10 @@ def update_streams():
                     status = EXCLUDED.status,
                     start_actual = COALESCE(oshilive.streams.start_actual, EXCLUDED.start_actual),
                     end_actual = EXCLUDED.end_actual,
-                    current_viewers = EXCLUDED.current_viewers,
+                    current_viewers = CASE 
+                            WHEN EXCLUDED.current_viewers > 0 THEN EXCLUDED.current_viewers 
+                            ELSE oshilive.streams.current_viewers 
+                          END,
                     updated_at = CURRENT_TIMESTAMP;
             """
             execute_values(cur, upsert_query, stream_values)
@@ -162,12 +165,14 @@ def update_streams():
                     end_actual = COALESCE(end_actual, CURRENT_TIMESTAMP),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status IN ('live', 'upcoming') AND NOT (stream_id = ANY(%s))
-                RETURNING stream_id;
+                RETURNING stream_id, current_viewers;
             """, (active_ids,))
 
             just_ended_streams = cur.fetchall()
 
             if just_ended_streams:
+                valid_streams = [row[0] for row in just_ended_streams if row[1] > 0]
+                
                 queue_query = """
                     INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)
                     VALUES %s ON CONFLICT (stream_id) DO NOTHING;
