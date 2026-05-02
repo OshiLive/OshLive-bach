@@ -154,10 +154,7 @@ class HighlightAnalyzer:
                     if current_min > last_logged_min:
                         logging.info(f"[{self.stream_id}] 수집 중... ({current_min}분 지점 / 메시지 {self.msg_count:,}개)")
                         last_logged_min = current_min
-                    
-                    # [트래픽 최적화] 무한 폴링 방지를 위한 강제 지연
-                    time.sleep(1)
-
+                time.sleep(1)
             return self._finalize_data()
 
         except Exception as e:
