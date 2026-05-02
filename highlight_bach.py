@@ -21,7 +21,7 @@ class Config:
         "password": os.getenv("DB_PASS"),
         "port": os.getenv("DB_PORT")
     }
-    WORKER_COUNT = 3
+    WORKER_COUNT = 2
     HIGHLIGHT_COUNT = 5
     THRESHOLD_MULTIPLIER = 2.0
     
@@ -42,11 +42,22 @@ class Config:
         "神": 1.5
     }
 
-# 로깅 설정
+# 로깅 설정 (콘솔 + 파일)
+log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# 파일 핸들러 (로그를 highlight_batch.log 파일에 저장)
+file_handler = logging.FileHandler('highlight_batch.log', encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# 콘솔 핸들러 (화면 출력은 중요한 것만)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.WARNING) # 콘솔은 WARNING 이상만 출력하여 SSH 트래픽 절감
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    handlers=[file_handler, console_handler]
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -138,11 +149,14 @@ class HighlightAnalyzer:
                     self.timeline_buckets[bucket_sec]["messages"] += 1
                     self.timeline_buckets[bucket_sec]["score"] += score
 
-                    # 진행 상황 로그
+                    # 진행 상황 로그 (파일에만 기록됨)
                     current_min = sec // 60
                     if current_min > last_logged_min:
                         logging.info(f"[{self.stream_id}] 수집 중... ({current_min}분 지점 / 메시지 {self.msg_count:,}개)")
                         last_logged_min = current_min
+                    
+                    # [트래픽 최적화] 무한 폴링 방지를 위한 강제 지연
+                    time.sleep(1)
 
             return self._finalize_data()
 
@@ -225,10 +239,11 @@ class HighlightWorker:
             time.sleep(10)
 
     def process_next_task(self):
-        # 현재 전체 현황 출력 (워커 중 한 명만 대표로 출력하거나 매번 출력)
+        # 작업 현황 로그 (진행 중인 작업이 있을 때만 가끔 출력)
         stats = DatabaseManager.get_queue_stats()
         total_remaining = stats['pending'] + stats['processing']
-        logging.info(f"[워커-{self.worker_id}] 현황: 대기({stats['pending']}), 처리중({stats['processing']}), 완료({stats['completed']}) -> 남은 작업: {total_remaining}")
+        if total_remaining > 0:
+            logging.info(f"[워커-{self.worker_id}] 현황: 대기({stats['pending']}), 처리중({stats['processing']}), 완료({stats['completed']}) -> 남은 작업: {total_remaining}")
 
         conn = DatabaseManager.get_connection()
         stream_id = None
