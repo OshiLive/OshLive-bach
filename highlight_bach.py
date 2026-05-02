@@ -1,4 +1,5 @@
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import Json, execute_values
 import logging
 import os
@@ -9,17 +10,40 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 
 # ==========================================
-# 1. 환경 변수 및 로깅 설정
+# 1. 설정 및 환경 변수
 # ==========================================
 load_dotenv()
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "database": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASS"),
-    "port": os.getenv("DB_PORT")
-}
 
+class Config:
+    DB_CONFIG = {
+        "host": os.getenv("DB_HOST"),
+        "database": os.getenv("DB_NAME"),
+        "user": os.getenv("DB_USER"),
+        "password": os.getenv("DB_PASS"),
+        "port": os.getenv("DB_PORT")
+    }
+    WORKER_COUNT = 3
+    HIGHLIGHT_COUNT = 5
+    THRESHOLD_MULTIPLIER = 2.0
+    
+    # 하이라이트 가중치 키워드 (일본어 방송 기준)
+    KEYWORDS = {
+        "w": 0.5,
+        "笑": 0.5,
+        "草": 0.8,
+        "888": 0.5,
+        "きた": 1.0,
+        "きちゃ": 1.0,
+        "おめ": 1.0,
+        "!": 0.2,
+        "?": 0.2,
+        "かわいい": 1.0,
+        "てぇてぇ": 1.5,
+        "たすかる": 1.2,
+        "神": 1.5
+    }
+
+# 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -35,8 +59,47 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("pytchat").setLevel(logging.WARNING) # pytchat 자체 로그도 제어
 
-def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
+# ==========================================
+# 2. 데이터베이스 매니저 (커넥션 풀 관리)
+# ==========================================
+class DatabaseManager:
+    _pool = None
+
+    @classmethod
+    def initialize(cls):
+        if not cls._pool:
+            logging.info("[DB] 커넥션 풀 초기화 중...")
+            cls._pool = pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=Config.WORKER_COUNT + 2,
+                **Config.DB_CONFIG
+            )
+
+    @classmethod
+    def get_connection(cls):
+        return cls._pool.getconn()
+
+    @classmethod
+    def release_connection(cls, conn):
+        cls._pool.putconn(conn)
+
+    @classmethod
+    def get_queue_stats(cls):
+        """현재 큐의 상태를 확인합니다."""
+        conn = cls.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE status = 0) as pending,
+                    COUNT(*) FILTER (WHERE status = 2) as processing,
+                    COUNT(*) FILTER (WHERE status = 1) as completed
+                FROM oshilive.highlight_batch_tasks;
+            """)
+            row = cur.fetchone()
+            return {"pending": row[0], "processing": row[1], "completed": row[2]}
+        finally:
+            cls.release_connection(conn)
 
 # ==========================================
 # 2. 핵심 로직: 유튜브 채팅 수집기 (안전장치 강화)
