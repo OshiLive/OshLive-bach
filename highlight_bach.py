@@ -43,6 +43,7 @@ class Config:
     }
 
 # 로깅 설정 (콘솔 + 파일)
+# sys.stdout.reconfigure(line_buffering=True) 대신 python -u 옵션 사용 권장
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 # 파일 핸들러 (로그를 highlight_batch.log 파일에 저장)
@@ -50,14 +51,15 @@ file_handler = logging.FileHandler('highlight_batch.log', encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 file_handler.setLevel(logging.INFO)
 
-# 콘솔 핸들러 (화면 출력은 중요한 것만)
+# 콘솔 핸들러 (화면 출력 최소화)
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
-console_handler.setLevel(logging.WARNING) # 콘솔은 WARNING 이상만 출력하여 SSH 트래픽 절감
+console_handler.setLevel(logging.WARNING)
 
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[file_handler, console_handler]
+    handlers=[file_handler, console_handler],
+    force=True  # 기존 설정 초기화 후 재설정
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -126,8 +128,10 @@ class HighlightAnalyzer:
                 items = chat.get().sync_items()
                 if not items:
                     empty_retry += 1
-                    if empty_retry >= 15: break
-                    time.sleep(2)
+                    if empty_retry >= 20: 
+                        logging.warning(f"[{self.stream_id}] 20회 연속 데이터 없음 -> 분석 조기 종료")
+                        break
+                    time.sleep(5) # 데이터 없을 때 대기 시간 증가 (IP 차단 방지)
                     continue
                 
                 empty_retry = 0
