@@ -21,7 +21,7 @@ class Config:
         "password": os.getenv("DB_PASS"),
         "port": os.getenv("DB_PORT")
     }
-    WORKER_COUNT = 2
+    WORKER_COUNT = 3
     HIGHLIGHT_COUNT = 5
     THRESHOLD_MULTIPLIER = 2.0
     
@@ -63,6 +63,8 @@ logging.basicConfig(
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ==========================================
 # 2. 데이터베이스 매니저 (커넥션 풀 관리)
@@ -82,11 +84,46 @@ class DatabaseManager:
 
     @classmethod
     def get_connection(cls):
-        return cls._pool.getconn()
+        """끊긴 연결을 감지하고 필요 시 재연결하여 안전한 연결을 반환합니다."""
+        if not cls._pool:
+            cls.initialize()
+        
+        try:
+            conn = cls._pool.getconn()
+            # 간단한 쿼리로 연결 상태 확인
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return conn
+        except Exception:
+            logging.warning("[DB] 연결 유실 감지, 커넥션 풀 재초기화 중...")
+            try:
+                if cls._pool: cls._pool.closeall()
+            except: pass
+            cls._pool = None
+            cls.initialize()
+            return cls._pool.getconn()
 
     @classmethod
     def release_connection(cls, conn):
-        cls._pool.putconn(conn)
+        if cls._pool and conn:
+            try:
+                cls._pool.putconn(conn)
+            except:
+                pass
+
+    @classmethod
+    def reset_stuck_tasks(cls):
+        """프로그램 시작 시 '처리중(2)' 상태로 멈춘 유령 작업들을 '대기(0)'로 되돌립니다."""
+        conn = cls.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 0 WHERE status = 2;")
+            count = cur.rowcount
+            if count > 0:
+                logging.info(f"[DB] 유령 작업 {count}개를 대기 상태로 복구했습니다.")
+            conn.commit()
+        finally:
+            cls.release_connection(conn)
 
     @classmethod
     def get_queue_stats(cls):
@@ -125,7 +162,8 @@ class HighlightAnalyzer:
             last_logged_min = -1
 
             while chat.is_alive():
-                items = chat.get().sync_items()
+                # sync_items() 대신 items를 사용하여 실시간 대기 없이 즉시 모든 데이터 수집
+                items = chat.get().items
                 if not items:
                     empty_retry += 1
                     if empty_retry >= 20: 
@@ -158,11 +196,16 @@ class HighlightAnalyzer:
                     if current_min > last_logged_min:
                         logging.info(f"[{self.stream_id}] 수집 중... ({current_min}분 지점 / 메시지 {self.msg_count:,}개)")
                         last_logged_min = current_min
+                # [트래픽/CPU 최적화] 데이터 요청 한 번당 1초 지연
                 time.sleep(1)
             return self._finalize_data()
 
         except Exception as e:
-            logging.error(f"[{self.stream_id}] 분석 중 오류 발생: {e}")
+            err_msg = str(e)
+            if "Cannot find channel id" in err_msg:
+                logging.error(f"[{self.stream_id}] 무효한 영상 또는 차단됨: {err_msg}")
+            else:
+                logging.error(f"[{self.stream_id}] 분석 중 예외 발생: {e}")
             return None, 0
 
     def _parse_time(self, time_str):
@@ -234,8 +277,12 @@ class HighlightWorker:
         while True:
             try:
                 self.process_next_task()
+            except psycopg2.InterfaceError:
+                logging.error(f"[워커-{self.worker_id}] DB 인터페이스 에러 - 재시도 대기")
+                time.sleep(30)
             except Exception as e:
-                logging.error(f"[워커-{self.worker_id}] 치명적 오류 발생: {e}")
+                logging.error(f"[워커-{self.worker_id}] 예상치 못한 오류 발생: {e}")
+                time.sleep(10)
             
             time.sleep(10)
 
@@ -323,6 +370,7 @@ class HighlightWorker:
 # ==========================================
 if __name__ == "__main__":
     DatabaseManager.initialize()
+    DatabaseManager.reset_stuck_tasks() # 멈춘 작업 자동 복구
     logging.info(f"하이라이트 배치 시스템 v2 시작 (워커 수: {Config.WORKER_COUNT})")
     
     with ThreadPoolExecutor(max_workers=Config.WORKER_COUNT) as executor:
