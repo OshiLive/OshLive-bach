@@ -174,28 +174,33 @@ class HighlightAnalyzer:
                 
                 empty_retry = 0
                 for c in items:
-                    self.msg_count += 1
-                    sec = self._parse_time(c.elapsedTime)
-                    if sec > self.total_duration: self.total_duration = sec
+                    try:
+                        self.msg_count += 1
+                        sec = self._parse_time(c.elapsedTime)
+                        if sec > self.total_duration: self.total_duration = sec
 
-                    # 점수 계산 (기본 1점 + 키워드 가중치)
-                    score = 1.0
-                    for kw, weight in Config.KEYWORDS.items():
-                        if kw in c.message:
-                            score += weight
+                        # 점수 계산 (기본 1점 + 키워드 가중치)
+                        score = 1.0
+                        for kw, weight in Config.KEYWORDS.items():
+                            if kw in c.message:
+                                score += weight
 
-                    bucket_sec = (sec // 60) * 60
-                    if bucket_sec not in self.timeline_buckets:
-                        self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0}
-                    
-                    self.timeline_buckets[bucket_sec]["messages"] += 1
-                    self.timeline_buckets[bucket_sec]["score"] += score
+                        bucket_sec = (sec // 60) * 60
+                        if bucket_sec not in self.timeline_buckets:
+                            self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0}
+                        
+                        self.timeline_buckets[bucket_sec]["messages"] += 1
+                        self.timeline_buckets[bucket_sec]["score"] += score
 
-                    # 진행 상황 로그 (파일에만 기록됨)
-                    current_min = sec // 60
-                    if current_min > last_logged_min:
-                        logging.info(f"[{self.stream_id}] 수집 중... ({current_min}분 지점 / 메시지 {self.msg_count:,}개)")
-                        last_logged_min = current_min
+                        # 진행 상황 로그 (파일에만 기록됨)
+                        current_min = sec // 60
+                        if current_min > last_logged_min:
+                            logging.info(f"[{self.stream_id}] 수집 중... ({current_min}분 지점 / 메시지 {self.msg_count:,}개)")
+                            last_logged_min = current_min
+                    except Exception as e:
+                        # 개별 메시지 처리 실패 시 로그만 남기고 다음 메시지로 진행
+                        logging.debug(f"[{self.stream_id}] 메시지 처리 스킵: {e}")
+                        continue
                 # [트래픽/CPU 최적화] 데이터 요청 한 번당 1초 지연
                 time.sleep(1)
             return self._finalize_data()
@@ -209,12 +214,20 @@ class HighlightAnalyzer:
             return None, 0
 
     def _parse_time(self, time_str):
-        parts = time_str.replace("-", "").split(":")
-        if len(parts) == 3:
-            return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
-        elif len(parts) == 2:
-            return int(parts[0])*60 + int(parts[1])
-        return int(parts[0])
+        if not time_str: return 0
+        try:
+            parts = time_str.replace("-", "").split(":")
+            # 빈 부분 제거 및 숫자로 변환 가능한 것만 필터링
+            parts = [p for p in parts if p.strip()]
+            if not parts: return 0
+            
+            if len(parts) == 3:
+                return int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+            elif len(parts) == 2:
+                return int(parts[0])*60 + int(parts[1])
+            return int(parts[0])
+        except Exception:
+            return 0
 
     def _finalize_data(self):
         if not self.timeline_buckets: return [], 0
