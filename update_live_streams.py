@@ -165,13 +165,13 @@ def update_streams():
                     end_actual = COALESCE(end_actual, CURRENT_TIMESTAMP),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status IN ('live', 'upcoming') AND NOT (stream_id = ANY(%s))
-                RETURNING stream_id, current_viewers;
+                RETURNING stream_id, COALESCE(current_viewers, 0);
             """, (active_ids,))
 
             just_ended_streams = cur.fetchall()
 
             if just_ended_streams:
-                valid_streams = [row[0] for row in just_ended_streams if row[1] > 0]
+                valid_streams = [row[0] for row in just_ended_streams if (row[1] or 0) > 0]
                 
                 queue_query = """
                     INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)

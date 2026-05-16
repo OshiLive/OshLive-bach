@@ -162,28 +162,50 @@ class HighlightAnalyzer:
             last_logged_min = -1
 
             while chat.is_alive():
-                # sync_items() 대신 items를 사용하여 실시간 대기 없이 즉시 모든 데이터 수집
-                items = chat.get().items
-                if not items:
-                    empty_retry += 1
-                    if empty_retry >= 20: 
-                        logging.warning(f"[{self.stream_id}] 20회 연속 데이터 없음 -> 분석 조기 종료")
-                        break
-                    time.sleep(5) # 데이터 없을 때 대기 시간 증가 (IP 차단 방지)
+                try:
+                    # sync_items() 대신 items를 사용하여 실시간 대기 없이 즉시 모든 데이터 수집
+                    data = chat.get()
+                    if data is None:
+                        empty_retry += 1
+                        if empty_retry >= 20: 
+                            logging.warning(f"[{self.stream_id}] 20회 연속 데이터 없음 -> 분석 조기 종료")
+                            break
+                        time.sleep(5) 
+                        continue
+                    
+                    items = data.items
+                    if not items:
+                        empty_retry += 1
+                        if empty_retry >= 20: 
+                            logging.warning(f"[{self.stream_id}] 20회 연속 빈 데이터 -> 분석 조기 종료")
+                            break
+                        time.sleep(5)
+                        continue
+                except Exception as e:
+                    # httpcore KeyError: 207 등의 라이브러리 내부 에러 발생 시 재시도
+                    logging.warning(f"[{self.stream_id}] 데이터 수집 루프 중 오류 발생 (재시도): {e}")
+                    time.sleep(5)
                     continue
                 
                 empty_retry = 0
                 for c in items:
+                    if c is None: continue
                     try:
                         self.msg_count += 1
-                        sec = self._parse_time(c.elapsedTime)
+                        # 안전하게 속성 가져오기
+                        msg = getattr(c, 'message', '')
+                        elapsed = getattr(c, 'elapsedTime', '')
+                        
+                        if not elapsed: continue
+                        sec = self._parse_time(elapsed)
                         if sec > self.total_duration: self.total_duration = sec
 
                         # 점수 계산 (기본 1점 + 키워드 가중치)
                         score = 1.0
-                        for kw, weight in Config.KEYWORDS.items():
-                            if kw in c.message:
-                                score += weight
+                        if msg:
+                            for kw, weight in Config.KEYWORDS.items():
+                                if kw in msg:
+                                    score += weight
 
                         bucket_sec = (sec // 60) * 60
                         if bucket_sec not in self.timeline_buckets:
