@@ -322,12 +322,6 @@ class HighlightWorker:
             time.sleep(10)
 
     def process_next_task(self):
-        # 작업 현황 로그 (진행 중인 작업이 있을 때만 가끔 출력)
-        stats = DatabaseManager.get_queue_stats()
-        total_remaining = stats['pending'] + stats['processing']
-        if total_remaining > 0:
-            logging.info(f"[워커-{self.worker_id}] 현황: 대기({stats['pending']}), 처리중({stats['processing']}), 완료({stats['completed']}) -> 남은 작업: {total_remaining}")
-
         conn = DatabaseManager.get_connection()
         stream_id = None
         try:
@@ -347,7 +341,10 @@ class HighlightWorker:
             stream_id = row[0]
             cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 2, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
             conn.commit()
-            logging.info(f"[워커-{self.worker_id}] 작업 시작: {stream_id}")
+            
+            # 작업을 시작할 때만 현황 로그를 출력하도록 개선
+            stats = DatabaseManager.get_queue_stats()
+            logging.info(f"[워커-{self.worker_id}] 작업 시작: {stream_id} (대기: {stats['pending']}, 처리중: {stats['processing']}, 완료: {stats['completed']})")
             
         finally:
             DatabaseManager.release_connection(conn)
