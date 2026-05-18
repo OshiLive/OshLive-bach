@@ -207,7 +207,7 @@ class HighlightAnalyzer:
                                 if kw in msg:
                                     score += weight
 
-                        bucket_sec = (sec // 60) * 60
+                        bucket_sec = (sec // 30) * 30
                         if bucket_sec not in self.timeline_buckets:
                             self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0}
                         
@@ -254,31 +254,47 @@ class HighlightAnalyzer:
     def _finalize_data(self):
         if not self.timeline_buckets: return [], 0
         
+        # 30초 단위 데이터를 1분 단위로 합산 (프론트엔드 그래프 호환성 유지)
+        minute_buckets = {}
+        for k, v in self.timeline_buckets.items():
+            min_sec = (k // 60) * 60
+            if min_sec not in minute_buckets:
+                minute_buckets[min_sec] = {"messages": 0, "score": 0.0}
+            minute_buckets[min_sec]["messages"] += v["messages"]
+            minute_buckets[min_sec]["score"] += v["score"]
+
         timeline_data = [
             {"time_sec": k, "messages": v["messages"], "score": round(v["score"], 2)} 
-            for k, v in self.timeline_buckets.items()
+            for k, v in minute_buckets.items()
         ]
         timeline_data.sort(key=lambda x: x["time_sec"])
         
         logging.info(f"[{self.stream_id}] 분석 완료! (총 {self.total_duration // 60}분)")
         return timeline_data, self.total_duration
 
-    def extract_segments(self, timeline_data):
-        """점수가 높은 하이라이트 구간을 추출합니다. (중복 방지 로직 포함)"""
-        if not timeline_data: return []
+    def extract_segments(self, timeline_data=None):
+        """30초 버킷 데이터를 기반으로 정밀한 하이라이트 구간(60초)을 추출합니다."""
+        if not self.timeline_buckets: return []
 
-        # 평균 점수 기반 필터링
-        avg_score = sum(item["score"] for item in timeline_data) / len(timeline_data)
-        peaks = [item for item in timeline_data if item["score"] >= (avg_score * Config.THRESHOLD_MULTIPLIER)]
+        # 30초 단위 데이터를 리스트로 변환 및 정렬
+        buckets_30s = [
+            {"time_sec": k, "messages": v["messages"], "score": round(v["score"], 2)}
+            for k, v in self.timeline_buckets.items()
+        ]
+        buckets_30s.sort(key=lambda x: x["time_sec"])
+
+        # 평균 점수 기반 필터링 (30초 단위 평균 점수 사용)
+        avg_score = sum(item["score"] for item in buckets_30s) / len(buckets_30s)
+        peaks = [item for item in buckets_30s if item["score"] >= (avg_score * Config.THRESHOLD_MULTIPLIER)]
         peaks.sort(key=lambda x: x["score"], reverse=True)
 
         selected_segments = []
         for peak in peaks:
             if len(selected_segments) >= Config.HIGHLIGHT_COUNT: break
             
-            p_time = peak["time_sec"]
-            start = max(0, p_time - 30)
-            end = p_time + 90
+            p_time = peak["time_sec"]      # 30초 피크 버킷의 시작 시각
+            start = max(0, p_time - 15)   # 앞 15초 추가 빌드업
+            end = p_time + 45             # 피크 30초 + 뒤 15초 = 총 60초 (1분) 클립 완성
             
             # 이미 선택된 구간과 겹치는지 확인 (최소 1분 간격 유지)
             is_overlap = False
@@ -288,7 +304,8 @@ class HighlightAnalyzer:
                     break
             
             if not is_overlap:
-                mini_chart = [item["messages"] for item in timeline_data if start <= item["time_sec"] <= end]
+                # 미니 차트는 30초 단위 버킷에서 추출
+                mini_chart = [item["messages"] for item in buckets_30s if start <= item["time_sec"] <= end]
                 selected_segments.append({
                     "start": start,
                     "end": end,
