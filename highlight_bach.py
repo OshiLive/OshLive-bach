@@ -225,15 +225,23 @@ class HighlightAnalyzer:
                         continue
                 # [트래픽/CPU 최적화] 데이터 요청 한 번당 1초 지연
                 time.sleep(1)
+            
+            # 수집 루프 종료 후 백그라운드 스레드에서 오류가 발생했는지 검증
+            chat.raise_for_status()
+            
             return self._finalize_data()
 
         except Exception as e:
             err_msg = str(e)
-            if "Cannot find channel id" in err_msg:
-                logging.error(f"[{self.stream_id}] 무효한 영상 또는 차단됨: {err_msg}")
-            else:
-                logging.error(f"[{self.stream_id}] 분석 중 예외 발생: {e}")
-            return None, 0
+            err_type = type(e).__name__
+            # 무효한 영상, 비공개, 채팅 불가능 등의 영구적인 에러는 None, 0을 반환하여 status = 9(스킵) 처리
+            if "Cannot find channel id" in err_msg or "NoChatData" in err_type or "InvalidVideo" in err_type or "Unavailable" in err_type:
+                logging.error(f"[{self.stream_id}] 무효한 영상 또는 차단됨/채팅 없음: {err_msg} ({err_type})")
+                return None, 0
+            
+            # 네트워크 끊김 등 일시적인 에러는 예외를 위로 던져 status = 0(대기)으로 복구하고 재시도하도록 함
+            logging.error(f"[{self.stream_id}] 분석 중 일시적 예외 발생 (재시도 예정): {e} ({err_type})")
+            raise e
 
     def _parse_time(self, time_str):
         if not time_str: return 0
@@ -322,6 +330,23 @@ class HighlightWorker:
     def __init__(self, worker_id):
         self.worker_id = worker_id
 
+    def reset_task_to_pending(self, stream_id):
+        """작업 도중 오류가 발생했을 때 상태를 2(처리중)에서 0(대기)으로 안전하게 되돌립니다."""
+        conn = DatabaseManager.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE oshilive.highlight_batch_tasks 
+                SET status = 0, updated_at = CURRENT_TIMESTAMP 
+                WHERE stream_id = %s;
+            """, (stream_id,))
+            conn.commit()
+            logging.info(f"[워커-{self.worker_id}] 성공적으로 [{stream_id}] 작업을 대기(0) 상태로 복구했습니다.")
+        except Exception as e:
+            logging.error(f"[워커-{self.worker_id}] [{stream_id}] 작업 복구 실패: {e}")
+        finally:
+            DatabaseManager.release_connection(conn)
+
     def run(self):
         logging.info(f"[워커-{self.worker_id}] 업무 대기 중...")
         time.sleep(self.worker_id * 2) # 시작 시간 분산
@@ -368,12 +393,16 @@ class HighlightWorker:
 
         if not stream_id: return
 
-        # 분석 실행
-        analyzer = HighlightAnalyzer(stream_id)
-        timeline_data, duration = analyzer.analyze()
-        
-        # 결과 저장
-        self.save_results(stream_id, timeline_data, duration, analyzer)
+        try:
+            # 분석 실행
+            analyzer = HighlightAnalyzer(stream_id)
+            timeline_data, duration = analyzer.analyze()
+            
+            # 결과 저장
+            self.save_results(stream_id, timeline_data, duration, analyzer)
+        except Exception as e:
+            logging.error(f"[워커-{self.worker_id}] 작업 중 오류 발생 (대기 상태로 복구): {e}")
+            self.reset_task_to_pending(stream_id)
 
     def save_results(self, stream_id, timeline_data, duration, analyzer):
         conn = DatabaseManager.get_connection()
