@@ -156,12 +156,51 @@ class HighlightAnalyzer:
     def analyze(self):
         """유튜브 채팅을 수집하고 점수를 계산합니다."""
         logging.info(f"[{self.stream_id}] 채팅 데이터 분석 시작...")
+        
+        last_continuation = None
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        empty_retry = 0
+        last_logged_min = -1
+        chat = None
+
         try:
             chat = pytchat.create(video_id=self.stream_id, interruptable=False)
-            empty_retry = 0
-            last_logged_min = -1
+            
+            while True:
+                # 만약 chat이 활성화되어 있지 않거나 에러가 있으면 재연결 시도
+                if chat is None or not chat.is_alive():
+                    err = None
+                    if chat is not None:
+                        try:
+                            chat.raise_for_status()
+                        except Exception as e:
+                            err = e
+                    
+                    if err is not None:
+                        # 에러가 발생해서 종료된 경우 -> 재연결 시도
+                        if last_continuation:
+                            consecutive_errors += 1
+                            if consecutive_errors > max_consecutive_errors:
+                                logging.error(f"[{self.stream_id}] 연속 오류 횟수 초과 ({consecutive_errors}회) -> 분석 실패 처리")
+                                raise err
+                            
+                            logging.warning(f"[{self.stream_id}] 분석 중 오류 발생 ({err}). 마지막 위치에서 재연결 시도 중... (시도 {consecutive_errors}/{max_consecutive_errors})")
+                            time.sleep(5)
+                            try:
+                                chat = pytchat.create(video_id=self.stream_id, replay_continuation=last_continuation, interruptable=False)
+                                continue
+                            except Exception as reconnect_err:
+                                logging.error(f"[{self.stream_id}] 재연결 객체 생성 실패: {reconnect_err}")
+                                continue
+                        else:
+                            # continuation이 없는 상태에서 처음부터 에러 발생
+                            raise err
+                    else:
+                        # 에러 없이 정상적으로 종료된 경우 -> 완료!
+                        logging.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (더 이상 데이터 없음)")
+                        break
 
-            while chat.is_alive():
                 try:
                     # sync_items() 대신 items를 사용하여 실시간 대기 없이 즉시 모든 데이터 수집
                     data = chat.get()
@@ -182,12 +221,22 @@ class HighlightAnalyzer:
                         time.sleep(5)
                         continue
                 except Exception as e:
-                    # httpcore KeyError: 207 등의 라이브러리 내부 에러 발생 시 재시도
-                    logging.warning(f"[{self.stream_id}] 데이터 수집 루프 중 오류 발생 (재시도): {e}")
+                    consecutive_errors += 1
+                    logging.warning(f"[{self.stream_id}] 데이터 가져오기 중 오류 발생 ({e}). 재연결을 위해 대기합니다. (시도 {consecutive_errors}/{max_consecutive_errors})")
                     time.sleep(5)
+                    if chat:
+                        try: chat.terminate()
+                        except: pass
                     continue
-                
+
+                # 정상적으로 데이터를 수집했으므로 연속 에러 횟수 및 빈 데이터 횟수 초기화
+                consecutive_errors = 0
                 empty_retry = 0
+
+                # 마지막 continuation 파라미터 업데이트
+                if chat.continuation:
+                    last_continuation = chat.continuation
+                
                 for c in items:
                     if c is None: continue
                     try:
@@ -225,9 +274,6 @@ class HighlightAnalyzer:
                         continue
                 # [트래픽/CPU 최적화] 데이터 요청 한 번당 1초 지연
                 time.sleep(1)
-            
-            # 수집 루프 종료 후 백그라운드 스레드에서 오류가 발생했는지 검증
-            chat.raise_for_status()
             
             return self._finalize_data()
 
@@ -401,8 +447,9 @@ class HighlightWorker:
             # 결과 저장
             self.save_results(stream_id, timeline_data, duration, analyzer)
         except Exception as e:
-            logging.error(f"[워커-{self.worker_id}] 작업 중 오류 발생 (대기 상태로 복구): {e}")
+            logging.error(f"[워커-{self.worker_id}] 작업 중 오류 발생 (대기 상태로 복구 후 60초 대기): {e}")
             self.reset_task_to_pending(stream_id)
+            time.sleep(60)  # 유튜브 레이트 리밋 완화를 위한 대기시간 추가
 
     def save_results(self, stream_id, timeline_data, duration, analyzer):
         conn = DatabaseManager.get_connection()
