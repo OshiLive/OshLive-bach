@@ -107,6 +107,11 @@ class DatabaseManager:
     def release_connection(cls, conn):
         if cls._pool and conn:
             try:
+                # 풀에 반환하기 전에 혹시 남아있을 수 있는 트랜잭션/락 상태를 깨끗이 정리합니다.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 cls._pool.putconn(conn)
             except:
                 pass
@@ -163,15 +168,18 @@ class HighlightAnalyzer:
         empty_retry = 0
         last_logged_min = -1
         chat = None
+        pending_error = None
 
         try:
             chat = pytchat.create(video_id=self.stream_id, interruptable=False)
             
             while True:
                 # 만약 chat이 활성화되어 있지 않거나 에러가 있으면 재연결 시도
-                if chat is None or not chat.is_alive():
-                    err = None
-                    if chat is not None:
+                if chat is None or not chat.is_alive() or pending_error is not None:
+                    err = pending_error
+                    pending_error = None  # 소비했으므로 초기화
+                    
+                    if err is None and chat is not None:
                         try:
                             chat.raise_for_status()
                         except Exception as e:
@@ -192,6 +200,7 @@ class HighlightAnalyzer:
                                 continue
                             except Exception as reconnect_err:
                                 logging.error(f"[{self.stream_id}] 재연결 객체 생성 실패: {reconnect_err}")
+                                pending_error = reconnect_err
                                 continue
                         else:
                             # continuation이 없는 상태에서 처음부터 에러 발생
@@ -221,12 +230,12 @@ class HighlightAnalyzer:
                         time.sleep(5)
                         continue
                 except Exception as e:
-                    consecutive_errors += 1
-                    logging.warning(f"[{self.stream_id}] 데이터 가져오기 중 오류 발생 ({e}). 재연결을 위해 대기합니다. (시도 {consecutive_errors}/{max_consecutive_errors})")
+                    logging.warning(f"[{self.stream_id}] 데이터 가져오기 중 오류 발생 ({e}). 재연결을 위해 대기합니다.")
                     time.sleep(5)
                     if chat:
                         try: chat.terminate()
                         except: pass
+                    pending_error = e
                     continue
 
                 # 정상적으로 데이터를 수집했으므로 연속 에러 횟수 및 빈 데이터 횟수 초기화
