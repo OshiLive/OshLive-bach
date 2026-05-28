@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import pytchat
+from pytchat.exceptions import ChatDataFinished
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 
@@ -63,8 +64,8 @@ logging.basicConfig(
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
 
 # ==========================================
 # 2. 데이터베이스 매니저 (커넥션 풀 관리)
@@ -81,6 +82,16 @@ class DatabaseManager:
                 maxconn=Config.WORKER_COUNT + 2,
                 **Config.DB_CONFIG
             )
+            # retry_count 컬럼 자동 마이그레이션
+            try:
+                conn = cls._pool.getconn()
+                with conn.cursor() as cur:
+                    cur.execute("ALTER TABLE oshilive.highlight_batch_tasks ADD COLUMN IF NOT EXISTS retry_count smallint DEFAULT 0;")
+                conn.commit()
+                cls._pool.putconn(conn)
+                logging.info("[DB] retry_count 컬럼 마이그레이션 확인 완료")
+            except Exception as e:
+                logging.warning(f"[DB] retry_count 마이그레이션 스킵: {e}")
 
     @classmethod
     def get_connection(cls):
@@ -182,24 +193,35 @@ class HighlightAnalyzer:
                     if err is None and chat is not None:
                         try:
                             chat.raise_for_status()
+                        except ChatDataFinished:
+                            logging.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (ChatDataFinished)")
+                            break
                         except Exception as e:
                             err = e
                     
                     if err is not None:
+                        # ChatDataFinished는 정상 완료 신호 → 즉시 성공 처리
+                        if isinstance(err, ChatDataFinished):
+                            logging.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (ChatDataFinished)")
+                            break
+                        
                         # 에러가 발생해서 종료된 경우 -> 재연결 시도
                         if last_continuation:
                             consecutive_errors += 1
                             if consecutive_errors > max_consecutive_errors:
-                                logging.error(f"[{self.stream_id}] 연속 오류 횟수 초과 ({consecutive_errors}회) -> 분석 실패 처리")
+                                logging.error(f"[{self.stream_id}] 연속 오류 횟수 초과 ({consecutive_errors}회) → 분석 실패 처리")
                                 raise err
                             
-                            logging.warning(f"[{self.stream_id}] 분석 중 오류 발생 ({err}). 마지막 위치에서 재연결 시도 중... (시도 {consecutive_errors}/{max_consecutive_errors})")
+                            logging.warning(f"[{self.stream_id}] 재연결 시도 중... ({consecutive_errors}/{max_consecutive_errors})")
                             time.sleep(5)
                             try:
                                 chat = pytchat.create(video_id=self.stream_id, replay_continuation=last_continuation, interruptable=False)
                                 continue
+                            except ChatDataFinished:
+                                logging.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (ChatDataFinished)")
+                                break
                             except Exception as reconnect_err:
-                                logging.error(f"[{self.stream_id}] 재연결 객체 생성 실패: {reconnect_err}")
+                                logging.error(f"[{self.stream_id}] 재연결 실패: {reconnect_err}")
                                 pending_error = reconnect_err
                                 continue
                         else:
@@ -229,8 +251,11 @@ class HighlightAnalyzer:
                             break
                         time.sleep(5)
                         continue
+                except ChatDataFinished:
+                    logging.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (ChatDataFinished)")
+                    break
                 except Exception as e:
-                    logging.warning(f"[{self.stream_id}] 데이터 가져오기 중 오류 발생 ({e}). 재연결을 위해 대기합니다.")
+                    logging.warning(f"[{self.stream_id}] 데이터 수집 오류 ({type(e).__name__}). 재연결 대기 중...")
                     time.sleep(5)
                     if chat:
                         try: chat.terminate()
@@ -286,6 +311,11 @@ class HighlightAnalyzer:
             
             return self._finalize_data()
 
+        except ChatDataFinished:
+            # 안전장치: 루프 밖에서 ChatDataFinished가 잡힌 경우에도 정상 완료 처리
+            logging.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (ChatDataFinished)")
+            return self._finalize_data()
+
         except Exception as e:
             err_msg = str(e)
             err_type = type(e).__name__
@@ -294,8 +324,8 @@ class HighlightAnalyzer:
                 logging.error(f"[{self.stream_id}] 무효한 영상 또는 차단됨/채팅 없음: {err_msg} ({err_type})")
                 return None, 0
             
-            # 네트워크 끊김 등 일시적인 에러는 예외를 위로 던져 status = 0(대기)으로 복구하고 재시도하도록 함
-            logging.error(f"[{self.stream_id}] 분석 중 일시적 예외 발생 (재시도 예정): {e} ({err_type})")
+            # 네트워크 끊김 등 일시적인 에러는 예외를 위로 던져 retry_count 기반 재시도/스킵 처리
+            logging.error(f"[{self.stream_id}] 분석 실패 ({err_type}): {e}")
             raise e
 
     def _parse_time(self, time_str):
@@ -385,20 +415,35 @@ class HighlightWorker:
     def __init__(self, worker_id):
         self.worker_id = worker_id
 
-    def reset_task_to_pending(self, stream_id):
-        """작업 도중 오류가 발생했을 때 상태를 2(처리중)에서 0(대기)으로 안전하게 되돌립니다."""
+    def handle_task_failure(self, stream_id):
+        """작업 실패 시 retry_count를 확인하여 재시도 또는 영구 실패(status=9) 처리합니다."""
         conn = DatabaseManager.get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("""
-                UPDATE oshilive.highlight_batch_tasks 
-                SET status = 0, updated_at = CURRENT_TIMESTAMP 
-                WHERE stream_id = %s;
-            """, (stream_id,))
-            conn.commit()
-            logging.info(f"[워커-{self.worker_id}] 성공적으로 [{stream_id}] 작업을 대기(0) 상태로 복구했습니다.")
+            cur.execute("SELECT retry_count FROM oshilive.highlight_batch_tasks WHERE stream_id = %s;", (stream_id,))
+            row = cur.fetchone()
+            current_retry = (row[0] or 0) if row else 0
+            
+            if current_retry >= 3:
+                # 3회 이상 실패 → 분석 불가능한 영상으로 판단, 영구 스킵
+                cur.execute("""
+                    UPDATE oshilive.highlight_batch_tasks 
+                    SET status = 9, updated_at = CURRENT_TIMESTAMP 
+                    WHERE stream_id = %s;
+                """, (stream_id,))
+                conn.commit()
+                logging.warning(f"[워커-{self.worker_id}] [{stream_id}] 재시도 한도 초과 ({current_retry}회) → 분석 불가(status=9) 처리")
+            else:
+                # 재시도 횟수 증가 후 대기 상태로 복구
+                cur.execute("""
+                    UPDATE oshilive.highlight_batch_tasks 
+                    SET status = 0, retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP 
+                    WHERE stream_id = %s;
+                """, (stream_id,))
+                conn.commit()
+                logging.info(f"[워커-{self.worker_id}] [{stream_id}] 재시도 대기 ({current_retry + 1}/3)")
         except Exception as e:
-            logging.error(f"[워커-{self.worker_id}] [{stream_id}] 작업 복구 실패: {e}")
+            logging.error(f"[워커-{self.worker_id}] [{stream_id}] 상태 업데이트 실패: {e}")
         finally:
             DatabaseManager.release_connection(conn)
 
@@ -456,8 +501,8 @@ class HighlightWorker:
             # 결과 저장
             self.save_results(stream_id, timeline_data, duration, analyzer)
         except Exception as e:
-            logging.error(f"[워커-{self.worker_id}] 작업 중 오류 발생 (대기 상태로 복구 후 60초 대기): {e}")
-            self.reset_task_to_pending(stream_id)
+            logging.error(f"[워커-{self.worker_id}] [{stream_id}] 작업 실패: {e}")
+            self.handle_task_failure(stream_id)
             time.sleep(60)  # 유튜브 레이트 리밋 완화를 위한 대기시간 추가
 
     def save_results(self, stream_id, timeline_data, duration, analyzer):
@@ -486,7 +531,7 @@ class HighlightWorker:
                     ]
                     execute_values(cur, "INSERT INTO oshilive.highlight_segments (stream_id, start_time_sec, end_time_sec, mini_chart_data) VALUES %s;", segment_values)
                 
-                cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 1, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
+                cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 1, retry_count = 0, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
                 logging.info(f"[워커-{self.worker_id}] 성공: [{stream_id}] 분석 및 저장 완료!")
             else:
                 cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 9, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
