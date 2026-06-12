@@ -466,13 +466,16 @@ class HighlightWorker:
     def process_next_task(self):
         conn = DatabaseManager.get_connection()
         stream_id = None
+        retry_count = 0
         try:
             cur = conn.cursor()
-            # 작업 하나 가져오기
+            # 작업 하나 가져오기 (30분 유예 시간 조건 및 retry_count 함께 조회)
             cur.execute("""
-                SELECT stream_id FROM oshilive.highlight_batch_tasks 
-                WHERE status = 0 
-                ORDER BY created_at ASC 
+                SELECT t.stream_id, t.retry_count FROM oshilive.highlight_batch_tasks t
+                LEFT JOIN oshilive.streams s ON t.stream_id = s.stream_id
+                WHERE t.status = 0 
+                  AND (s.end_actual IS NULL OR s.end_actual <= NOW() - INTERVAL '30 minutes')
+                ORDER BY t.created_at ASC 
                 LIMIT 1 FOR UPDATE SKIP LOCKED;
             """)
             row = cur.fetchone()
@@ -481,6 +484,7 @@ class HighlightWorker:
                 return
                 
             stream_id = row[0]
+            retry_count = (row[1] or 0) if row else 0
             cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 2, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
             conn.commit()
             
@@ -499,13 +503,13 @@ class HighlightWorker:
             timeline_data, duration = analyzer.analyze()
             
             # 결과 저장
-            self.save_results(stream_id, timeline_data, duration, analyzer)
+            self.save_results(stream_id, timeline_data, duration, analyzer, retry_count)
         except Exception as e:
             logging.error(f"[워커-{self.worker_id}] [{stream_id}] 작업 실패: {e}")
             self.handle_task_failure(stream_id)
             time.sleep(60)  # 유튜브 레이트 리밋 완화를 위한 대기시간 추가
 
-    def save_results(self, stream_id, timeline_data, duration, analyzer):
+    def save_results(self, stream_id, timeline_data, duration, analyzer, retry_count=0):
         conn = DatabaseManager.get_connection()
         try:
             cur = conn.cursor()
@@ -534,12 +538,18 @@ class HighlightWorker:
                 cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 1, retry_count = 0, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
                 logging.info(f"[워커-{self.worker_id}] 성공: [{stream_id}] 분석 및 저장 완료!")
             else:
-                cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 9, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
-                logging.warning(f"[워커-{self.worker_id}] 스킵: [{stream_id}] 분석 데이터가 없습니다.")
+                if retry_count < 3:
+                    # 아직 재시도 횟수가 남았다면 예외를 발생시켜 handle_task_failure에서 재시도 하도록 유도
+                    raise ValueError(f"분석 데이터가 비어 있습니다 (retry_count: {retry_count}). 유튜브 채팅 인코딩 지연 가능성.")
+                else:
+                    cur.execute("UPDATE oshilive.highlight_batch_tasks SET status = 9, updated_at = CURRENT_TIMESTAMP WHERE stream_id = %s;", (stream_id,))
+                    logging.warning(f"[워커-{self.worker_id}] 스킵: [{stream_id}] 3회 재시도에도 분석 데이터가 없습니다.")
             
             conn.commit()
         except Exception as e:
             conn.rollback()
+            if isinstance(e, ValueError) and "분석 데이터가 비어 있습니다" in str(e):
+                raise e
             logging.error(f"[워커-{self.worker_id}] 결과 저장 중 오류 발생: {e}")
         finally:
             DatabaseManager.release_connection(conn)
