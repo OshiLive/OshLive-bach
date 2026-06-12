@@ -476,7 +476,7 @@ class HighlightWorker:
                 WHERE t.status = 0 
                   AND (s.end_actual IS NULL OR s.end_actual <= NOW() - INTERVAL '30 minutes')
                 ORDER BY t.created_at ASC 
-                LIMIT 1 FOR UPDATE SKIP LOCKED;
+                LIMIT 1 FOR UPDATE OF t SKIP LOCKED;
             """)
             row = cur.fetchone()
             
