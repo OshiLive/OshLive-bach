@@ -78,6 +78,8 @@ def enrich_channel_data(target_data):
         
         # 데이터 가공
         banner = data.get('banner') or data.get('header')
+        if banner and ("googleusercontent.com" not in banner and "ggpht.com" not in banner):
+            banner = None
         views = data.get('view_count') or 0
         handle = data.get('yt_handle')[0] if data.get('yt_handle') else None
         

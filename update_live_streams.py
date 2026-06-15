@@ -80,6 +80,10 @@ def update_streams():
             for c_id in missing_ids:
                 c_data = fetch_channel_info(c_id)
                 if c_data:
+                    banner_url = c_data.get('banner')
+                    if banner_url and ("googleusercontent.com" not in banner_url and "ggpht.com" not in banner_url):
+                        banner_url = None
+                        
                     query = """
                         INSERT INTO oshilive.channels (
                             channel_id, name, english_name, org, profile_img_url, 
@@ -89,7 +93,7 @@ def update_streams():
                     """
                     cur.execute(query, (
                         c_data['id'], c_data['name'], c_data.get('english_name'), c_data.get('org'),
-                        c_data.get('photo'), c_data.get('banner'), c_data.get('description'), 
+                        c_data.get('photo'), banner_url, c_data.get('description'), 
                         c_data.get('twitter'), c_data.get('lang')
                     ))
                     logging.info(f" └─ 신규 채널 등록: {c_data['name']}")
