@@ -39,9 +39,9 @@ def get_existing_data():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT channel_id, name, subscriber_count, video_count FROM oshilive.channels")
+        cur.execute("SELECT channel_id, name, subscriber_count, video_count, profile_img_url FROM oshilive.channels")
         rows = cur.fetchall()
-        return {row[0]: {"name": row[1], "subs": row[2], "vids": row[3]} for row in rows}
+        return {row[0]: {"name": row[1], "subs": row[2], "vids": row[3], "photo": row[4]} for row in rows}
     except Exception as e:
         logging.error(f"❌ 기존 데이터 로드 중 에러: {e}")
         return {}
@@ -146,7 +146,7 @@ def run_batch():
                     update_values.append(create_tuple(channel))
                 else:
                     old = existing_data[c_id]
-                    if old['name'] != c_name or old['subs'] != new_subs or old['vids'] != new_vids:
+                    if old['name'] != c_name or old['subs'] != new_subs or old['vids'] != new_vids or old['photo'] != channel.get('photo'):
                         stats["updated"] += 1
                         update_values.append(create_tuple(channel))
                     else:
