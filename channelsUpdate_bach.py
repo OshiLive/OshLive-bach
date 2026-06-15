@@ -106,9 +106,8 @@ def save_to_db(values):
 
 def check_and_fix_single_image(session, channel, old_photo=None):
     """
-    개별 채널의 프로필 이미지 유효성을 검사하고, 깨진 이미지(404)인 경우
-    복구 우선순위: Holodex 정적 캐시 → 기존 DB 백업 → 유튜브 채널 페이지 스크래핑
-    'default-user' 플레이스홀더 URL은 모든 단계에서 거부합니다.
+    개별 채널의 프로필 이미지 유효성을 검사하고, 깨진 이미지(404)인 경우 
+    기존 DB에 저장된 백업 주소(googleusercontent)를 재사용하거나 유튜브 채널 페이지에서 직접 og:image를 파싱하여 복구합니다.
     """
     c_id = channel.get('id')
     c_name = channel.get('name')
@@ -118,77 +117,46 @@ def check_and_fix_single_image(session, channel, old_photo=None):
         return channel
         
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     
     try:
-        # 1. 현재 photo URL이 유효한지 검사 (GET stream=True)
+        # 1. GET stream=True 와 User-Agent 헤더로 SSL EOF 및 봇 차단 우회 (session 사용)
         resp = session.get(photo_url, headers=headers, stream=True, timeout=3)
         status_code = resp.status_code
-        resp.close()
+        resp.close()  # 커넥션 자원 즉시 반환
         
         if status_code == 404:
             logging.info(f"⚠️ [이미지 깨짐 감지] {c_name} ({c_id}) - 복구 시도")
             
-            # 2. [1순위] Holodex 정적 캐시에서 프로필 이미지 가져오기
-            #    Holodex는 자체 CDN에 채널 이미지를 캐싱하므로, 유튜브에서 삭제된 채널도 유효한 이미지를 보유
-            holodex_cache_url = f"https://holodex.net/statics/channelImg/{c_id}/100.png"
-            try:
-                cache_resp = session.get(holodex_cache_url, headers=headers, stream=True, timeout=5)
-                cache_status = cache_resp.status_code
-                cache_resp.close()
-                if cache_status == 200:
-                    logging.info(f"✅ [Holodex 캐시 복구 성공] {c_name} ➔ {holodex_cache_url}")
-                    channel['photo'] = holodex_cache_url
-                    return channel
-            except Exception:
-                pass  # Holodex 캐시 실패 시 다음 단계로 진행
-            
-            # 3. [2순위] 기존 DB에 이미 복구된 유효한 주소가 있다면 재사용
-            if old_photo and "default-user" not in old_photo:
-                logging.info(f"♻️ [이미지 재사용] {c_name} -> 기존 DB 백업 주소 사용 ({old_photo[:60]}...)")
+            # 2. 기존 DB에 이미 복구된 유효한 googleusercontent.com 주소가 있다면, 스크래핑 없이 바로 재사용
+            if old_photo and "googleusercontent.com" in old_photo:
+                logging.info(f"♻️ [이미지 재사용] {c_name} -> 기존 DB 백업 주소 사용 ({old_photo[:50]}...)")
                 channel['photo'] = old_photo
                 return channel
                 
-            # 4. [3순위] 유튜브 채널 페이지에서 실시간 og:image 태그 긁어오기
+            # 3. 유튜브 채널 페이지에서 실시간 og:image 태그 긁어오기 (No API Key 우회법)
             yt_url = f"https://www.youtube.com/channel/{c_id}"
             yt_resp = session.get(yt_url, headers=headers, timeout=5)
             if yt_resp.status_code == 200:
-                # 삭제 또는 해지된 채널 감지
-                error_keywords = ["존재하지 않는 채널", "채널이 삭제", "채널이 해지", "위반했기 때문에"]
-                if any(kw in yt_resp.text for kw in error_keywords):
-                    logging.warning(f"❌ [채널 해지/삭제 감지] {c_name} ({c_id}) - 유튜브에서 접근할 수 없는 채널입니다.")
-                    if old_photo:
-                        channel['photo'] = old_photo
-                    return channel
-                
-                # og:image 추출 (default-user 제외)
                 match = re.search(r'<meta property="og:image" content="([^"]+)"', yt_resp.text)
                 if match:
                     new_photo = match.group(1)
-                    if "default-user" not in new_photo:
-                        logging.info(f"✅ [이미지 복구 성공] {c_name} ➔ {new_photo}")
-                        channel['photo'] = new_photo
-                        return channel
-                
-                # avatar JSON 추출 (default-user 제외)
-                match2 = re.search(r'"avatar":.*?{"url":"([^"]+)"', yt_resp.text)
-                if match2:
-                    new_photo = match2.group(1)
-                    if "default-user" not in new_photo:
+                    logging.info(f"✅ [이미지 복구 성공] {c_name} ➔ {new_photo}")
+                    channel['photo'] = new_photo
+                else:
+                    match2 = re.search(r'"avatar":.*?{"url":"([^"]+)"', yt_resp.text)
+                    if match2:
+                        new_photo = match2.group(1)
                         logging.info(f"✅ [이미지 복구 성공(avatar)] {c_name} ➔ {new_photo}")
                         channel['photo'] = new_photo
-                        return channel
-                
-                logging.warning(f"❌ [이미지 복구 실패] {c_name} - 유효한 프로필 이미지를 찾지 못함")
-                if old_photo:
-                    channel['photo'] = old_photo
+                    else:
+                        logging.warning(f"❌ [이미지 복구 실패] {c_name} - 유튜브 페이지에서 이미지 태그를 찾지 못함")
             else:
                 logging.warning(f"❌ [이미지 복구 실패] {c_name} - 유튜브 채널 페이지 접근 실패 ({yt_resp.status_code})")
-                if old_photo:
-                    channel['photo'] = old_photo
     except Exception as e:
         logging.warning(f"⚠️ {c_name} 이미지 검증 중 에러 발생: {e}")
+        # SSL 에러 등으로 검증에 실패한 경우 기존 DB 이미지가 있으면 일단 보존하는 안전 장치 추가
         if old_photo:
             logging.info(f"🛡️ [검증 실패 대응] {c_name} -> 기존 DB 주소 보존 ({old_photo[:50]}...)")
             channel['photo'] = old_photo
@@ -327,4 +295,4 @@ if __name__ == "__main__":
     parser.add_argument("--force-img-check", action="store_true", help="수정 변동이 없는 모든 채널에 대해서도 이미지 깨짐 여부를 검사하고 강제 복구합니다.")
     args = parser.parse_args()
     
-    run_batch(force_img_check=args.force_img_check)
+    run_batch(force_img_check=args.force_img_check)
