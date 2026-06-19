@@ -166,6 +166,7 @@ def update_streams(mode="short"):
             ON CONFLICT (stream_id) DO UPDATE SET
                 title = EXCLUDED.title,
                 status = EXCLUDED.status,
+                start_scheduled = EXCLUDED.start_scheduled,
                 start_actual = COALESCE(oshilive.streams.start_actual, EXCLUDED.start_actual),
                 end_actual = EXCLUDED.end_actual,
                 current_viewers = CASE 
