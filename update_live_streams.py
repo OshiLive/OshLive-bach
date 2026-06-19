@@ -3,6 +3,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 import os
 import logging
+import argparse
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from enrich_channels_parallel import run_full_parallel_enrichment
@@ -39,170 +40,211 @@ def fetch_channel_info(channel_id):
         logging.error(f" └─ ❌ API 호출 실패 ({channel_id}): {e}")
     return None
 
-def update_streams():
+def update_streams(mode="short"):
     # 2. API 데이터 먼저 가져오기 (DB 연결 전)
     now_utc = datetime.now(timezone.utc)
-    from_date = (now_utc - timedelta(hours=6)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    to_date = (now_utc + timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
-
     url = "https://holodex.net/api/v2/live"
-    params = {
-        "type": "stream", "status": "live,upcoming",
-        "from": from_date, "to": to_date,
-        "org": "Hololive", "limit": 100
-    }
     headers = {"X-APIKEY": API_KEY}
+    streams = []
 
+    if mode == "short":
+        # 단기 모드: 24시간 이내 데이터만 1회 호출
+        params = {
+            "type": "stream", "status": "live,upcoming",
+            "org": "Hololive", "limit": 100,
+            "max_upcoming_hours": 24
+        }
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=20)
+            if resp.status_code == 200:
+                streams = resp.json()
+        except Exception as e:
+            logging.error(f"API 호출 실패: {e}")
+    else:
+        # 장기 모드: 14일(336시간) 치 데이터를 페이징하여 모두 수집
+        offset = 0
+        limit = 50
+        while True:
+            params = {
+                "type": "stream", "status": "live,upcoming",
+                "org": "Hololive", "limit": limit, "offset": offset,
+                "max_upcoming_hours": 336
+            }
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=20)
+                if resp.status_code != 200:
+                    break
+                chunk = resp.json()
+                streams.extend(chunk)
+                if len(chunk) < limit:
+                    break
+                offset += limit
+            except Exception as e:
+                logging.error(f"API 호출 실패 (offset={offset}): {e}")
+                break
+
+    if not streams:
+        logging.info(f"ℹ️ [{mode.upper()} MODE] 현재 수집된 활성 스트림이 없습니다.")
+        return
+
+    logging.info(f"[{mode.upper()} MODE] API에서 {len(streams)}개의 방송 데이터를 가져왔습니다.")
+
+    # 3. DB 연결 시작
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=20)
-        streams = resp.json() if resp.status_code == 200 else []
-        if not streams:
-            logging.info("ℹ️ 현재 수집된 활성 스트림이 없습니다.")
-            return
-
-        # 3. DB 연결 시작 (필요한 시점에 최소한으로 열기)
         conn = get_db_connection()
         cur = conn.cursor()
         
-        try:
-            # 채널 ID 추출
-            all_ids = {s['channel']['id'] for s in streams}
-            for s in streams:
-                if s.get('mentions'):
-                    for m in s['mentions']: all_ids.add(m['id'])
-            
-            # 기존 채널 확인
-            cur.execute("SELECT channel_id FROM oshilive.channels WHERE channel_id = ANY(%s)", (list(all_ids),))
-            existing_ids = {r[0] for r in cur.fetchall()}
-            missing_ids = all_ids - existing_ids
+        # 채널 ID 추출
+        all_ids = {s['channel']['id'] for s in streams}
+        for s in streams:
+            if s.get('mentions'):
+                for m in s['mentions']: all_ids.add(m['id'])
+        
+        # 기존 채널 확인
+        cur.execute("SELECT channel_id FROM oshilive.channels WHERE channel_id = ANY(%s)", (list(all_ids),))
+        existing_ids = {r[0] for r in cur.fetchall()}
+        missing_ids = all_ids - existing_ids
 
-            # 신규 채널 등록 (API 호출 시에는 커넥션을 끊거나 짧게 유지하는게 좋으나 일단 유지)
-            for c_id in missing_ids:
-                c_data = fetch_channel_info(c_id)
-                if c_data:
-                    banner_url = c_data.get('banner')
-                    if banner_url and ("googleusercontent.com" not in banner_url and "ggpht.com" not in banner_url):
-                        banner_url = None
-                        
-                    query = """
-                        INSERT INTO oshilive.channels (
-                            channel_id, name, english_name, org, profile_img_url, 
-                            banner_img_url, description, twitter_id, lang, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                        ON CONFLICT (channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;
-                    """
-                    cur.execute(query, (
-                        c_data['id'], c_data['name'], c_data.get('english_name'), c_data.get('org'),
-                        c_data.get('photo'), banner_url, c_data.get('description'), 
-                        c_data.get('twitter'), c_data.get('lang')
-                    ))
-                    logging.info(f" └─ 신규 채널 등록: {c_data['name']}")
-            
-            conn.commit() # 채널 등록 확정
-
-            # 4. 스트림 데이터 가공 및 UPSERT
-            stream_values = []
-            collab_values = []
-            stats_values = []
-            active_ids = [s['id'] for s in streams]
-
-            for s in streams:
-                stream_values.append((
-                    s['id'], s['channel']['id'], s['title'], s.get('topic_id'), s['status'],
-                    s.get('start_scheduled'), s.get('start_actual'), s.get('end_actual'),
-                    f"https://i.ytimg.com/vi/{s['id']}/maxresdefault.jpg",
-                    s.get('live_viewers', 0)
-                ))
-                #합방 데이터
-                if s.get('mentions'):
-                    for m in s['mentions']: collab_values.append((s['id'], m['id']))
-                #시청자 수 수집
-                if s.get('status') == 'live':
-                    stats_values.append((s['id'], s.get('live_viewers', 0)))
-            
-            if stats_values:
-                stats_values.sort(key=lambda x: x[1], reverse=True)
-                
-                current_time = datetime.now().strftime("%Y.%m.%d %H:%M")
-                
-                # 문자열 덧셈(+) 대신 리스트에 담아 한 번에 join 하는 것이 메모리에 더 좋습니다.
-                log_lines = [f"\n---------LIVE LIST {current_time}--------"]
-                
-                for stream_id, viewers in stats_values:
-                    log_lines.append(f"{stream_id} : {viewers:,} 명")
+        # 신규 채널 등록
+        for c_id in missing_ids:
+            c_data = fetch_channel_info(c_id)
+            if c_data:
+                banner_url = c_data.get('banner')
+                if banner_url and ("googleusercontent.com" not in banner_url and "ggpht.com" not in banner_url):
+                    banner_url = None
                     
-                log_lines.append("--------------------------------------")
-                
-                logging.info("\n".join(log_lines))
+                query = """
+                    INSERT INTO oshilive.channels (
+                        channel_id, name, english_name, org, profile_img_url, 
+                        banner_img_url, description, twitter_id, lang, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;
+                """
+                cur.execute(query, (
+                    c_data['id'], c_data['name'], c_data.get('english_name'), c_data.get('org'),
+                    c_data.get('photo'), banner_url, c_data.get('description'), 
+                    c_data.get('twitter'), c_data.get('lang')
+                ))
+                logging.info(f" └─ 신규 채널 등록: {c_data['name']}")
+        
+        conn.commit()
 
-            upsert_query = """
-                INSERT INTO oshilive.streams (
-                    stream_id, channel_id, title, topic_id, status, 
-                    start_scheduled, start_actual, end_actual, thumbnail_url, current_viewers
-                ) VALUES %s
-                ON CONFLICT (stream_id) DO UPDATE SET
-                    title = EXCLUDED.title,
-                    status = EXCLUDED.status,
-                    start_actual = COALESCE(oshilive.streams.start_actual, EXCLUDED.start_actual),
-                    end_actual = EXCLUDED.end_actual,
-                    current_viewers = CASE 
-                            WHEN EXCLUDED.current_viewers > 0 THEN EXCLUDED.current_viewers 
-                            ELSE oshilive.streams.current_viewers 
-                          END,
-                    updated_at = CURRENT_TIMESTAMP;
-            """
-            execute_values(cur, upsert_query, stream_values)
+        # 4. 스트림 데이터 가공 및 UPSERT
+        stream_values = []
+        collab_values = []
+        stats_values = []
+        active_ids = [s['id'] for s in streams]
 
-            # 합방 INSERT
-            if collab_values:
-                execute_values(cur, "INSERT INTO oshilive.stream_collabs VALUES %s ON CONFLICT DO NOTHING", collab_values)
+        for s in streams:
+            stream_values.append((
+                s['id'], s['channel']['id'], s['title'], s.get('topic_id'), s['status'],
+                s.get('start_scheduled'), s.get('start_actual'), s.get('end_actual'),
+                f"https://i.ytimg.com/vi/{s['id']}/maxresdefault.jpg",
+                s.get('live_viewers', 0)
+            ))
+            #합방 데이터
+            if s.get('mentions'):
+                for m in s['mentions']: collab_values.append((s['id'], m['id']))
+            #시청자 수 수집
+            if s.get('status') == 'live':
+                stats_values.append((s['id'], s.get('live_viewers', 0)))
+        
+        if stats_values:
+            stats_values.sort(key=lambda x: x[1], reverse=True)
+            current_time = datetime.now().strftime("%Y.%m.%d %H:%M")
+            log_lines = [f"\n---------LIVE LIST {current_time}--------"]
+            for stream_id, viewers in stats_values:
+                log_lines.append(f"{stream_id} : {viewers:,} 명")
+            log_lines.append("--------------------------------------")
+            logging.info("\n".join(log_lines))
 
-            # 시청자수 INSERT
-            if stats_values:
-                execute_values(cur, "INSERT INTO oshilive.stream_stats (stream_id, viewer_count) VALUES %s", stats_values)
+        upsert_query = """
+            INSERT INTO oshilive.streams (
+                stream_id, channel_id, title, topic_id, status, 
+                start_scheduled, start_actual, end_actual, thumbnail_url, current_viewers
+            ) VALUES %s
+            ON CONFLICT (stream_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                status = EXCLUDED.status,
+                start_actual = COALESCE(oshilive.streams.start_actual, EXCLUDED.start_actual),
+                end_actual = EXCLUDED.end_actual,
+                current_viewers = CASE 
+                        WHEN EXCLUDED.current_viewers > 0 THEN EXCLUDED.current_viewers 
+                        ELSE oshilive.streams.current_viewers 
+                      END,
+                updated_at = CURRENT_TIMESTAMP;
+        """
+        execute_values(cur, upsert_query, stream_values)
 
+        # 합방 INSERT
+        if collab_values:
+            execute_values(cur, "INSERT INTO oshilive.stream_collabs VALUES %s ON CONFLICT DO NOTHING", collab_values)
 
-            # 5. 종료 상태 업데이트
+        # 시청자수 INSERT
+        if stats_values:
+            execute_values(cur, "INSERT INTO oshilive.stream_stats (stream_id, viewer_count) VALUES %s", stats_values)
+
+        # 5. 종료 상태 업데이트
+        # 주의: short 모드일 경우, 먼 미래(24시간 이후)의 예약 방송은 active_ids에 포함되지 않으므로
+        # 실수로 past로 처리되는 것을 방지해야 합니다.
+        if mode == "short":
             cur.execute("""
                 UPDATE oshilive.streams 
                 SET status = 'past', 
                     end_actual = COALESCE(end_actual, CURRENT_TIMESTAMP),
                     updated_at = CURRENT_TIMESTAMP
-                WHERE status IN ('live', 'upcoming') AND NOT (stream_id = ANY(%s))
+                WHERE status IN ('live', 'upcoming') 
+                  AND (start_scheduled IS NULL OR start_scheduled <= CURRENT_TIMESTAMP + INTERVAL '24 hours')
+                  AND NOT (stream_id = ANY(%s))
+                RETURNING stream_id, COALESCE(current_viewers, 0);
+            """, (active_ids,))
+        else:
+            cur.execute("""
+                UPDATE oshilive.streams 
+                SET status = 'past', 
+                    end_actual = COALESCE(end_actual, CURRENT_TIMESTAMP),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('live', 'upcoming') 
+                  AND NOT (stream_id = ANY(%s))
                 RETURNING stream_id, COALESCE(current_viewers, 0);
             """, (active_ids,))
 
-            just_ended_streams = cur.fetchall()
+        just_ended_streams = cur.fetchall()
 
-            if just_ended_streams:
-                valid_streams = [row[0] for row in just_ended_streams if (row[1] or 0) > 0]
-                
-                queue_query = """
-                    INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)
-                    VALUES %s ON CONFLICT (stream_id) DO NOTHING;
-                """
-
-                queue_values = [(row[0], 0) for row in just_ended_streams]
+        if just_ended_streams:
+            valid_streams = [row[0] for row in just_ended_streams if (row[1] or 0) > 0]
+            
+            queue_query = """
+                INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)
+                VALUES %s ON CONFLICT (stream_id) DO NOTHING;
+            """
+            queue_values = [(row[0], 0) for row in just_ended_streams]
+            if queue_values:
                 execute_values(cur, queue_query, queue_values)
                 logging.info(f" └─ 하이라이트 대기열 {len(queue_values)}건 등록 완료")
 
-
-            conn.commit()
-            logging.info(f"배치 완료: 방송 {len(stream_values)}개, 통계 {len(stats_values)}건 갱신")
-
-        except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
-            cur.close()
-            conn.close()
-            logging.info("DB 커넥션 반납 완료")
-
-        logging.info("신규채널 상세정보 업데이트")
-        run_full_parallel_enrichment(only_missing_info=True)
+        conn.commit()
+        logging.info(f"[{mode.upper()} MODE] 배치 완료: 방송 {len(stream_values)}개, 통계 {len(stats_values)}건 갱신")
 
     except Exception as e:
-        logging.error(f"배치 실행 중 에러: {e}")
+        conn.rollback()
+        logging.error(f"DB 트랜잭션 에러: {e}")
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+        logging.info("DB 커넥션 반납 완료")
+
+    logging.info("신규채널 상세정보 업데이트")
+    run_full_parallel_enrichment(only_missing_info=True)
 
 if __name__ == "__main__":
-    update_streams()
+    parser = argparse.ArgumentParser(description='OshiLive Stream Update Batch')
+    parser.add_argument('--mode', choices=['short', 'long'], default='short', 
+                        help='short: 당일 스케줄만 갱신 (1분 주기) / long: 14일치 전체 갱신 (1일 주기)')
+    args = parser.parse_args()
+    
+    try:
+        update_streams(mode=args.mode)
+    except Exception as e:
+        logging.error(f"배치 실행 중 에러: {e}")
