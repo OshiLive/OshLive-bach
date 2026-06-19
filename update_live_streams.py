@@ -61,14 +61,14 @@ def update_streams(mode="short"):
         except Exception as e:
             logging.error(f"API 호출 실패: {e}")
     else:
-        # 장기 모드: 14일(336시간) 치 데이터를 페이징하여 모두 수집
+        # 장기 모드: 30일(720시간) 치 데이터를 페이징하여 모두 수집
         offset = 0
         limit = 50
         while True:
             params = {
                 "type": "stream", "status": "live,upcoming",
                 "org": "Hololive", "limit": limit, "offset": offset,
-                "max_upcoming_hours": 336
+                "max_upcoming_hours": 720
             }
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=20)
@@ -241,7 +241,7 @@ def update_streams(mode="short"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='OshiLive Stream Update Batch')
     parser.add_argument('--mode', choices=['short', 'long'], default='short', 
-                        help='short: 당일 스케줄만 갱신 (1분 주기) / long: 14일치 전체 갱신 (1일 주기)')
+                        help='short: 당일 스케줄만 갱신 (1분 주기 권장) / long: 한달치 전체 갱신 (1일 주기 권장)')
     args = parser.parse_args()
     
     try:
