@@ -139,7 +139,7 @@ def update_streams(mode="short"):
             stream_values.append((
                 s['id'], s['channel']['id'], s['title'], s.get('topic_id'), s['status'],
                 s.get('start_scheduled'), s.get('start_actual'), s.get('end_actual'),
-                f"https://i.ytimg.com/vi/{s['id']}/maxresdefault.jpg",
+                f"https://i.ytimg.com/vi/{s['id']}/mqdefault.jpg",
                 s.get('live_viewers', 0)
             ))
             #합방 데이터
@@ -169,6 +169,7 @@ def update_streams(mode="short"):
                 start_scheduled = EXCLUDED.start_scheduled,
                 start_actual = COALESCE(oshilive.streams.start_actual, EXCLUDED.start_actual),
                 end_actual = EXCLUDED.end_actual,
+                thumbnail_url = EXCLUDED.thumbnail_url,
                 current_viewers = CASE 
                         WHEN EXCLUDED.current_viewers > 0 THEN EXCLUDED.current_viewers 
                         ELSE oshilive.streams.current_viewers 
