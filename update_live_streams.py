@@ -48,26 +48,37 @@ def update_streams(mode="short"):
     streams = []
 
     if mode == "short":
-        # 단기 모드: 24시간 이내 데이터만 1회 호출
-        params = {
-            "type": "stream", "status": "live,upcoming",
-            "org": "Hololive", "limit": 100,
-            "max_upcoming_hours": 24
-        }
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=20)
-            if resp.status_code == 200:
-                streams = resp.json()
-        except Exception as e:
-            logging.error(f"API 호출 실패: {e}")
-    else:
-        # 장기 모드: 30일(720시간) 치 데이터를 페이징하여 모두 수집
+        # 단기 모드: 24시간 이내 데이터를 페이징하여 모두 수집 (개인/모든 단체 포함)
         offset = 0
-        limit = 50
+        limit = 100
         while True:
             params = {
                 "type": "stream", "status": "live,upcoming",
-                "org": "Hololive", "limit": limit, "offset": offset,
+                "limit": limit, "offset": offset,
+                "max_upcoming_hours": 24
+            }
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=20)
+                if resp.status_code != 200:
+                    break
+                chunk = resp.json()
+                if not chunk:
+                    break
+                streams.extend(chunk)
+                if len(chunk) < limit:
+                    break
+                offset += limit
+            except Exception as e:
+                logging.error(f"API 호출 실패 (offset={offset}): {e}")
+                break
+    else:
+        # 장기 모드: 30일(720시간) 치 데이터를 페이징하여 모두 수집 (개인/모든 단체 포함)
+        offset = 0
+        limit = 100
+        while True:
+            params = {
+                "type": "stream", "status": "live,upcoming",
+                "limit": limit, "offset": offset,
                 "max_upcoming_hours": 720
             }
             try:
@@ -75,6 +86,8 @@ def update_streams(mode="short"):
                 if resp.status_code != 200:
                     break
                 chunk = resp.json()
+                if not chunk:
+                    break
                 streams.extend(chunk)
                 if len(chunk) < limit:
                     break
@@ -94,38 +107,53 @@ def update_streams(mode="short"):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 채널 ID 추출
-        all_ids = {s['channel']['id'] for s in streams}
+        # 방송 데이터에서 채널 정보 맵핑
+        channel_map = {}
         for s in streams:
+            c = s.get('channel')
+            if c and c.get('id'):
+                channel_map[c['id']] = c
             if s.get('mentions'):
-                for m in s['mentions']: all_ids.add(m['id'])
+                for m in s['mentions']:
+                    if m.get('id') and m['id'] not in channel_map:
+                        channel_map[m['id']] = m
         
         # 기존 채널 확인
+        all_ids = set(channel_map.keys())
         cur.execute("SELECT channel_id FROM oshilive.channels WHERE channel_id = ANY(%s)", (list(all_ids),))
         existing_ids = {r[0] for r in cur.fetchall()}
         missing_ids = all_ids - existing_ids
 
-        # 신규 채널 등록
-        for c_id in missing_ids:
-            c_data = fetch_channel_info(c_id)
-            if c_data:
+        # 신규 채널 등록 (추가 API 호출 없이 stream 내부의 channel payload 활용)
+        if missing_ids:
+            missing_values = []
+            for c_id in missing_ids:
+                c_data = channel_map[c_id]
                 banner_url = c_data.get('banner')
                 if banner_url and ("googleusercontent.com" not in banner_url and "ggpht.com" not in banner_url):
                     banner_url = None
                     
-                query = """
-                    INSERT INTO oshilive.channels (
-                        channel_id, name, english_name, org, profile_img_url, 
-                        banner_img_url, description, twitter_id, lang, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;
-                """
-                cur.execute(query, (
-                    c_data['id'], c_data['name'], c_data.get('english_name'), c_data.get('org'),
-                    c_data.get('photo'), banner_url, c_data.get('description'), 
-                    c_data.get('twitter'), c_data.get('lang')
+                missing_values.append((
+                    c_data['id'],
+                    c_data.get('name'),
+                    c_data.get('english_name'),
+                    c_data.get('org'),
+                    c_data.get('photo'),
+                    banner_url,
+                    c_data.get('description'),
+                    c_data.get('twitter'),
+                    c_data.get('lang')
                 ))
-                logging.info(f" └─ 신규 채널 등록: {c_data['name']}")
+                
+            insert_channel_query = """
+                INSERT INTO oshilive.channels (
+                    channel_id, name, english_name, org, profile_img_url, 
+                    banner_img_url, description, twitter_id, lang, updated_at
+                ) VALUES %s
+                ON CONFLICT (channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;
+            """
+            execute_values(cur, insert_channel_query, missing_values)
+            logging.info(f" └─ 신규 채널 {len(missing_values)}개 일괄 등록 완료")
         
         conn.commit()
 
