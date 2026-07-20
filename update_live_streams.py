@@ -226,7 +226,7 @@ def update_streams(mode="short"):
                 WHERE status IN ('live', 'upcoming') 
                   AND (start_scheduled IS NULL OR start_scheduled <= CURRENT_TIMESTAMP + INTERVAL '24 hours')
                   AND NOT (stream_id = ANY(%s))
-                RETURNING stream_id, COALESCE(current_viewers, 0);
+                RETURNING stream_id, topic_id, COALESCE(current_viewers, 0);
             """, (active_ids,))
         else:
             cur.execute("""
@@ -236,22 +236,24 @@ def update_streams(mode="short"):
                     updated_at = CURRENT_TIMESTAMP
                 WHERE status IN ('live', 'upcoming') 
                   AND NOT (stream_id = ANY(%s))
-                RETURNING stream_id, COALESCE(current_viewers, 0);
+                RETURNING stream_id, topic_id, COALESCE(current_viewers, 0);
             """, (active_ids,))
 
         just_ended_streams = cur.fetchall()
 
         if just_ended_streams:
-            valid_streams = [row[0] for row in just_ended_streams if (row[1] or 0) > 0]
-            
-            queue_query = """
-                INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)
-                VALUES %s ON CONFLICT (stream_id) DO NOTHING;
-            """
-            queue_values = [(row[0], 0) for row in just_ended_streams]
+            # topic_id != 'membersonly' 및 시청자 수 > 0인 공개 방송만 하이라이트 대기열에 등록
+            queue_values = [
+                (row[0], 0) for row in just_ended_streams 
+                if row[1] != 'membersonly' and (row[2] or 0) > 0
+            ]
             if queue_values:
+                queue_query = """
+                    INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)
+                    VALUES %s ON CONFLICT (stream_id) DO NOTHING;
+                """
                 execute_values(cur, queue_query, queue_values)
-                logging.info(f" └─ 하이라이트 대기열 {len(queue_values)}건 등록 완료")
+                logging.info(f" └─ 하이라이트 대기열 {len(queue_values)}건 등록 완료 (회원 전용 제외)")
 
         conn.commit()
         logging.info(f"[{mode.upper()} MODE] 배치 완료: 방송 {len(stream_values)}개, 통계 {len(stats_values)}건 갱신")
