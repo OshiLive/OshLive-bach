@@ -28,19 +28,21 @@ class Config:
     
     # 하이라이트 가중치 키워드 (일본어 방송 기준)
     KEYWORDS = {
-        "w": 0.5,
-        "笑": 0.5,
-        "草": 0.8,
-        "888": 0.5,
-        "きた": 1.0,
-        "きちゃ": 1.0,
+        "w": 1.0,
+        "笑": 1.0,
+        "草": 1.5,
+        "888": 0.2,      # 인사/박수 가중치 축소
+        "きた": 0.3,     # 오프닝 인사 가중치 축소
+        "きちゃ": 0.3,   # 오프닝 인사 가중치 축소
         "おめ": 1.0,
         "!": 0.2,
-        "?": 0.2,
+        "?": 0.3,
+        "!?": 1.5,
+        "????": 1.5,
         "かわいい": 1.0,
         "てぇてぇ": 1.5,
-        "たすかる": 1.2,
-        "神": 1.5
+        "たすかる": 1.5,
+        "神": 2.0
     }
 
 # 로깅 설정 (콘솔 + 파일)
@@ -366,7 +368,7 @@ class HighlightAnalyzer:
         return timeline_data, self.total_duration
 
     def extract_segments(self, timeline_data=None):
-        """30초 버킷 데이터를 기반으로 정밀한 하이라이트 구간(60초)을 추출합니다."""
+        """롤링 모멘텀(Spike Detection) 기반 하이라이트 구간(60초) 추출"""
         if not self.timeline_buckets: return []
 
         # 30초 단위 데이터를 리스트로 변환 및 정렬
@@ -376,18 +378,52 @@ class HighlightAnalyzer:
         ]
         buckets_30s.sort(key=lambda x: x["time_sec"])
 
-        # 평균 점수 기반 필터링 (30초 단위 평균 점수 사용)
-        avg_score = sum(item["score"] for item in buckets_30s) / len(buckets_30s)
-        peaks = [item for item in buckets_30s if item["score"] >= (avg_score * Config.THRESHOLD_MULTIPLIER)]
-        peaks.sort(key=lambda x: x["score"], reverse=True)
+        n_buckets = len(buckets_30s)
+        if n_buckets == 0: return []
+
+        global_avg_score = sum(item["score"] for item in buckets_30s) / n_buckets
+
+        # 롤링 모멘텀(Spike Score) 산출
+        # 직전 4개 버킷(2분)의 평균을 기준점(Baseline)으로 설정
+        LOOKBACK = 4
+        scored_buckets = []
+
+        for i, item in enumerate(buckets_30s):
+            current_score = item["score"]
+
+            # 직전 LOOKBACK(2분) 버킷 추출
+            lookback_items = buckets_30s[max(0, i - LOOKBACK):i]
+            if lookback_items:
+                rolling_avg = sum(b["score"] for b in lookback_items) / len(lookback_items)
+            else:
+                rolling_avg = global_avg_score
+
+            # 기준점(Baseline)은 최소 전역 평균의 50% 보장 (조용한 구간에서 1~2개 튄 것 방지)
+            baseline = max(rolling_avg, global_avg_score * 0.5)
+
+            # Spike Score: 직전 대비 상승 비율 * 현재 절대 점수 가중치
+            spike_ratio = current_score / (baseline + 1.0)
+            spike_score = current_score * spike_ratio
+
+            scored_buckets.append({
+                "time_sec": item["time_sec"],
+                "messages": item["messages"],
+                "score": item["score"],
+                "spike_score": round(spike_score, 2),
+                "spike_ratio": round(spike_ratio, 2)
+            })
+
+        # 평균 이상인 버킷 중 Spike Score 내림차순 정렬
+        peaks = [item for item in scored_buckets if item["score"] >= (global_avg_score * 0.8)]
+        peaks.sort(key=lambda x: x["spike_score"], reverse=True)
 
         selected_segments = []
         for peak in peaks:
             if len(selected_segments) >= Config.HIGHLIGHT_COUNT: break
             
             p_time = peak["time_sec"]      # 30초 피크 버킷의 시작 시각
-            start = max(0, p_time - 15)   # 앞 15초 추가 빌드업
-            end = p_time + 45             # 피크 30초 + 뒤 15초 = 총 60초 (1분) 클립 완성
+            start = max(0, p_time - 15)   # 앞 15초 빌드업
+            end = p_time + 45             # 총 60초 (1분) 클립 완성
             
             # 이미 선택된 구간과 겹치는지 확인 (최소 1분 간격 유지)
             is_overlap = False
@@ -397,7 +433,6 @@ class HighlightAnalyzer:
                     break
             
             if not is_overlap:
-                # 미니 차트는 30초 단위 버킷에서 추출
                 mini_chart = [item["messages"] for item in buckets_30s if start <= item["time_sec"] <= end]
                 selected_segments.append({
                     "start": start,
