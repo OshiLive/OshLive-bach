@@ -48,14 +48,19 @@ def update_streams(mode="short"):
     streams = []
 
     if mode == "short":
-        # 단기 모드: 24시간 이내 데이터를 페이징하여 모두 수집 (개인/모든 단체 포함)
+        # 단기 모드: 당일 자정(23:59:59)까지의 남은 시간 동안 예정된 방송 및 실시간 방송 수집
+        # (1분마다 흘러가는 24시간 슬라이딩 윈도우 때문에 미래 날짜 방송 숫자가 계속 변동되는 현상 차단)
+        now_local = datetime.now()
+        end_of_today = datetime(now_local.year, now_local.month, now_local.day, 23, 59, 59)
+        hours_left_today = max(1, int((end_of_today - now_local).total_seconds() / 3600) + 1)
+        
         offset = 0
         limit = 100
         while True:
             params = {
                 "type": "stream", "status": "live,upcoming",
                 "limit": limit, "offset": offset,
-                "max_upcoming_hours": 24
+                "max_upcoming_hours": hours_left_today
             }
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=20)
