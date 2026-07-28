@@ -6,6 +6,7 @@ import logging
 import argparse
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+import re
 from enrich_channels_parallel import run_full_parallel_enrichment
 
 # 1. 환경 변수 및 로그 설정
@@ -60,7 +61,8 @@ def update_streams(mode="short"):
             params = {
                 "type": "stream", "status": "live,upcoming",
                 "limit": limit, "offset": offset,
-                "max_upcoming_hours": hours_left_today
+                "max_upcoming_hours": hours_left_today,
+                "include_membersonly": "true"
             }
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=20)
@@ -84,7 +86,8 @@ def update_streams(mode="short"):
             params = {
                 "type": "stream", "status": "live,upcoming",
                 "limit": limit, "offset": offset,
-                "max_upcoming_hours": 720
+                "max_upcoming_hours": 720,
+                "include_membersonly": "true"
             }
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=20)
@@ -168,9 +171,19 @@ def update_streams(mode="short"):
         stats_values = []
         active_ids = [s['id'] for s in streams]
 
+        explicit_kws = ['メンバー限定', 'メン限', 'メン限定', 'member only', 'members only', "member's only", "members' only", 'membersonly']
+        shorthand_regex = re.compile(r'^(め|🔒|🔑)[\s\-\/\:\【]|【(め|🔒|🔑)】')
+
         for s in streams:
+            title = s.get('title', '')
+            topic_id = s.get('topic_id')
+            lower_title = title.lower()
+
+            if s.get('is_membersonly') or any(kw in lower_title for kw in explicit_kws) or shorthand_regex.search(title):
+                topic_id = 'membersonly'
+
             stream_values.append((
-                s['id'], s['channel']['id'], s['title'], s.get('topic_id'), s['status'],
+                s['id'], s['channel']['id'], title, topic_id, s['status'],
                 s.get('start_scheduled'), s.get('start_actual'), s.get('end_actual'),
                 f"https://i.ytimg.com/vi/{s['id']}/mqdefault.jpg",
                 s.get('live_viewers', 0)
