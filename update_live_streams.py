@@ -156,7 +156,7 @@ def update_streams(mode="short"):
             insert_channel_query = """
                 INSERT INTO oshilive.channels (
                     channel_id, name, english_name, org, profile_img_url, 
-                    banner_img_url, description, twitter_id, lang, updated_at
+                    banner_img_url, description, twitter_id, lang
                 ) VALUES %s
                 ON CONFLICT (channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP;
             """
