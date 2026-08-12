@@ -146,6 +146,17 @@ def main():
         conn.commit()
         logging.info("🎉 [성공] DB 트랜잭션 커밋 완료!")
 
+        # 4. VACUUM ANALYZE & REINDEX 실행 (데드 튜플 회수, 쿼리 통계 재작성, 인덱스 슬림화)
+        try:
+            logging.info("🧹 [DB 청소] VACUUM ANALYZE & REINDEX (용량 회수 + 쿼리 속도 0.01초 최적화) 수행 중...")
+            conn.autocommit = True
+            with conn.cursor() as cleanup_cur:
+                cleanup_cur.execute("VACUUM ANALYZE oshilive.stream_stats;")
+                cleanup_cur.execute("REINDEX TABLE oshilive.stream_stats;")
+            logging.info("✨ [DB 청소 완료] 물리 용량 회수, 쿼리 통계 재작성(ANALYZE), 인덱스 슬림화(REINDEX) 완료!")
+        except Exception as ve:
+            logging.warning(f"⚠️ DB 청소 수행 중 알림: {ve}")
+
         cur.close()
         conn.close()
 
