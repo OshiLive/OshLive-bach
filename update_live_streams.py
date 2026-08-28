@@ -172,6 +172,7 @@ def update_streams(mode="short"):
         active_ids = [s['id'] for s in streams]
 
         explicit_kws = ['メンバー限定', 'メン限', 'メン限定', 'member only', 'members only', "member's only", "members' only", 'membersonly']
+        exclude_kws = ['アーカイブ', 'アーカィブ', '体験', 'お試し', '後日', '公開', 'じゃない', 'ではありません', '以外', 'vault']
         shorthand_regex = re.compile(r'^(め|🔒|🔑)[\s\-\/\:\【]|【(め|🔒|🔑)】')
 
         for s in streams:
@@ -179,7 +180,11 @@ def update_streams(mode="short"):
             topic_id = s.get('topic_id')
             lower_title = title.lower()
 
-            if s.get('is_membersonly') or any(kw in lower_title for kw in explicit_kws) or shorthand_regex.search(title):
+            is_api_membersonly = bool(s.get('is_membersonly'))
+            has_explicit_kw = any(kw in lower_title for kw in explicit_kws) or bool(shorthand_regex.search(title))
+            has_exclude_kw = any(ex in title for ex in exclude_kws)
+
+            if is_api_membersonly or (has_explicit_kw and not has_exclude_kw):
                 topic_id = 'membersonly'
 
             stream_values.append((
@@ -211,6 +216,7 @@ def update_streams(mode="short"):
             ) VALUES %s
             ON CONFLICT (stream_id) DO UPDATE SET
                 title = EXCLUDED.title,
+                topic_id = EXCLUDED.topic_id,
                 status = EXCLUDED.status,
                 start_scheduled = EXCLUDED.start_scheduled,
                 start_actual = COALESCE(oshilive.streams.start_actual, EXCLUDED.start_actual),
