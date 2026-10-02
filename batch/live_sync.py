@@ -149,6 +149,21 @@ def process_and_save_streams(streams, mode: str = "short"):
             if stream_tuples:
                 execute_values(cur, stream_upsert_sql, stream_tuples, page_size=200)
 
+                # 실시간 방송(status = 'live') 시청자 수 1분 타임라인 기록 (oshilive.stream_stats)
+                now_utc = datetime.now(timezone.utc)
+                live_stats_rows = [
+                    (s[0], s[8], now_utc)
+                    for s in stream_tuples
+                    if s[3] == 'live' and s[8] is not None
+                ]
+                if live_stats_rows:
+                    stream_stat_insert_sql = """
+                    INSERT INTO oshilive.stream_stats (stream_id, viewer_count, collected_at)
+                    VALUES %s;
+                    """
+                    execute_values(cur, stream_stat_insert_sql, live_stats_rows, page_size=200)
+                    logger.info(f" └─ 실시간 방송 시청자 수 {len(live_stats_rows)}건 stream_stats 타임라인 적재 완료")
+
             # 방송 종료 감지 및 하이라이트 태스크 생성
             active_ids = [s[0] for s in stream_tuples]
             if active_ids:
