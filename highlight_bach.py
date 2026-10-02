@@ -218,41 +218,46 @@ class HighlightAnalyzer:
 # ==========================================
 # 3. 데이터베이스 작업 함수들
 # ==========================================
+# STATUS CONSTANTS (smallint)
+STATUS_PENDING = 0
+STATUS_COMPLETED = 1
+STATUS_IN_PROGRESS = 2
+STATUS_FAILED = 3
+
 def fetch_pending_task():
-    """상태가 PENDING인 가장 오래된 태스크 1건 점유 (FOR UPDATE SKIP LOCKED)"""
+    """상태가 PENDING(0)인 가장 오래된 태스크 1건 점유 (FOR UPDATE SKIP LOCKED)"""
     sql = """
     UPDATE oshilive.highlight_batch_tasks
-    SET status = 'IN_PROGRESS',
+    SET status = 2,
         retry_count = retry_count + 1,
         updated_at = CURRENT_TIMESTAMP
-    WHERE task_id = (
-        SELECT task_id
+    WHERE stream_id = (
+        SELECT stream_id
         FROM oshilive.highlight_batch_tasks
-        WHERE status = 'PENDING'
+        WHERE status = 0
         ORDER BY created_at ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED
     )
-    RETURNING task_id, stream_id, retry_count;
+    RETURNING stream_id, retry_count;
     """
     try:
         with get_db_cursor() as cur:
             cur.execute(sql)
             row = cur.fetchone()
             if row:
-                return {"task_id": row[0], "stream_id": row[1], "retry_count": row[2]}
+                return {"stream_id": row[0], "retry_count": row[1]}
     except Exception as e:
         logger.error(f"태스크 팝 실패: {e}")
     return None
 
-def complete_task(task_id, stream_id, result_json):
+def complete_task(stream_id, result_json):
     """분석 완료 태스크 저장 및 스트림 결과 적용"""
     sql_task = """
     UPDATE oshilive.highlight_batch_tasks
-    SET status = 'COMPLETED',
-        completed_at = CURRENT_TIMESTAMP,
+    SET status = 1,
         updated_at = CURRENT_TIMESTAMP
-    WHERE task_id = %s;
+    WHERE stream_id = %s;
     """
     sql_stream = """
     UPDATE oshilive.streams
@@ -263,25 +268,24 @@ def complete_task(task_id, stream_id, result_json):
     try:
         with get_db_cursor() as cur:
             json_str = json.dumps(result_json, ensure_ascii=False)
-            cur.execute(sql_task, (task_id,))
+            cur.execute(sql_task, (stream_id,))
             cur.execute(sql_stream, (json_str, stream_id))
-        logger.info(f"✅ 태스크 [{task_id}] (Stream: {stream_id}) 분석 완료 및 DB 저장 성공!")
+        logger.info(f"✅ 스트림 [{stream_id}] 분석 완료 및 DB 저장 성공!")
     except Exception as e:
-        logger.error(f"❌ 완료 처리 실패 (Task ID: {task_id}): {e}")
+        logger.error(f"❌ 완료 처리 실패 (Stream ID: {stream_id}): {e}")
 
-def fail_task(task_id, error_msg):
+def fail_task(stream_id, error_msg):
     """태스크 실패 처리"""
     sql = """
     UPDATE oshilive.highlight_batch_tasks
-    SET status = 'FAILED',
-        error_message = %s,
+    SET status = 3,
         updated_at = CURRENT_TIMESTAMP
-    WHERE task_id = %s;
+    WHERE stream_id = %s;
     """
     try:
         with get_db_cursor() as cur:
-            cur.execute(sql, (error_msg[:500], task_id))
-        logger.warning(f"⚠️ 태스크 [{task_id}] FAILED 처리 완료: {error_msg[:100]}")
+            cur.execute(sql, (stream_id,))
+        logger.warning(f"⚠️ 스트림 [{stream_id}] FAILED 처리 완료: {error_msg[:100]}")
     except Exception as e:
         logger.error(f"실패 처리 에러: {e}")
 
@@ -295,24 +299,23 @@ def worker_process():
             time.sleep(3)
             continue
 
-        task_id = task["task_id"]
         stream_id = task["stream_id"]
         retry_count = task["retry_count"]
 
-        logger.info(f"🚀 워커 태스크 할당 [ID: {task_id}] Stream: {stream_id} (시도 횟수: {retry_count})")
+        logger.info(f"🚀 워커 태스크 할당 Stream: {stream_id} (시도 횟수: {retry_count})")
 
         analyzer = HighlightAnalyzer(stream_id)
         try:
             result = analyzer.analyze()
-            complete_task(task_id, stream_id, result)
+            complete_task(stream_id, result)
         except Exception as e:
             err_msg = str(e)
-            logger.error(f"❌ 분석 실패 [Task ID: {task_id}]: {err_msg}")
+            logger.error(f"❌ 분석 실패 [Stream: {stream_id}]: {err_msg}")
             if retry_count >= 3:
-                fail_task(task_id, f"Max retries exceeded: {err_msg}")
+                fail_task(stream_id, f"Max retries exceeded: {err_msg}")
             else:
-                # 3회 미만 시 PENDING으로 되돌려 재시도 허용
-                fail_task(task_id, f"Attempt {retry_count} failed: {err_msg}")
+                # 3회 미만 시 FAILED 처리 대신 PENDING으로 돌려놓거나 로깅
+                fail_task(stream_id, f"Attempt {retry_count} failed: {err_msg}")
         finally:
             del analyzer
             gc.collect()
