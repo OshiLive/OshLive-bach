@@ -252,25 +252,50 @@ def fetch_pending_task():
     return None
 
 def complete_task(stream_id, result_json):
-    """분석 완료 태스크 저장 및 스트림 결과 적용"""
+    """분석 완료 태스크 저장 및 stream_highlights, highlight_segments DB 반영"""
     sql_task = """
     UPDATE oshilive.highlight_batch_tasks
     SET status = 1,
         updated_at = CURRENT_TIMESTAMP
     WHERE stream_id = %s;
     """
-    sql_stream = """
-    UPDATE oshilive.streams
-    SET highlight_json = %s,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE stream_id = %s;
+    
+    sql_highlight = """
+    INSERT INTO oshilive.stream_highlights (stream_id, timeline_data, updated_at)
+    VALUES (%s, %s, CURRENT_TIMESTAMP)
+    ON CONFLICT (stream_id) DO UPDATE SET
+        timeline_data = EXCLUDED.timeline_data,
+        updated_at = CURRENT_TIMESTAMP;
     """
+
+    sql_delete_segments = """
+    DELETE FROM oshilive.highlight_segments WHERE stream_id = %s;
+    """
+
+    sql_insert_segment = """
+    INSERT INTO oshilive.highlight_segments (stream_id, start_time_sec, end_time_sec, recommend_count, created_at)
+    VALUES (%s, %s, %s, 0, CURRENT_TIMESTAMP);
+    """
+
     try:
+        timeline_json = json.dumps(result_json.get("timeline", []), ensure_ascii=False)
+        highlights = result_json.get("highlights", [])
+
         with get_db_cursor() as cur:
-            json_str = json.dumps(result_json, ensure_ascii=False)
+            # 1. 태스크 완료 처리 (status = 1)
             cur.execute(sql_task, (stream_id,))
-            cur.execute(sql_stream, (json_str, stream_id))
-        logger.info(f"✅ 스트림 [{stream_id}] 분석 완료 및 DB 저장 성공!")
+            
+            # 2. stream_highlights 타임라인 데이터 저장
+            cur.execute(sql_highlight, (stream_id, timeline_json))
+
+            # 3. highlight_segments 구간 데이터 저장
+            cur.execute(sql_delete_segments, (stream_id,))
+            for h in highlights:
+                start_sec = h.get("timestamp_sec", 0)
+                end_sec = start_sec + 30
+                cur.execute(sql_insert_segment, (stream_id, start_sec, end_sec))
+
+        logger.info(f"✅ 스트림 [{stream_id}] 분석 완료 및 stream_highlights / segments DB 저장 성공! (하이라이트 {len(highlights)}개)")
     except Exception as e:
         logger.error(f"❌ 완료 처리 실패 (Stream ID: {stream_id}): {e}")
 
