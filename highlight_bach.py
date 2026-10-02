@@ -211,6 +211,7 @@ class HighlightAnalyzer:
 
         selected_highlights.sort(key=lambda x: x["timestamp_sec"])
         return {
+            "duration_sec": max(self.total_duration, 0),
             "timeline": timeline,
             "highlights": selected_highlights
         }
@@ -261,9 +262,11 @@ def complete_task(stream_id, result_json):
     """
     
     sql_highlight = """
-    INSERT INTO oshilive.stream_highlights (stream_id, timeline_data, updated_at)
-    VALUES (%s, %s, CURRENT_TIMESTAMP)
+    INSERT INTO oshilive.stream_highlights (stream_id, duration_sec, peak_viewers, timeline_data, updated_at)
+    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
     ON CONFLICT (stream_id) DO UPDATE SET
+        duration_sec = EXCLUDED.duration_sec,
+        peak_viewers = EXCLUDED.peak_viewers,
         timeline_data = EXCLUDED.timeline_data,
         updated_at = CURRENT_TIMESTAMP;
     """
@@ -278,6 +281,7 @@ def complete_task(stream_id, result_json):
     """
 
     try:
+        duration_sec = int(result_json.get("duration_sec") or 0)
         timeline_json = json.dumps(result_json.get("timeline", []), ensure_ascii=False)
         highlights = result_json.get("highlights", [])
 
@@ -286,7 +290,7 @@ def complete_task(stream_id, result_json):
             cur.execute(sql_task, (stream_id,))
             
             # 2. stream_highlights 타임라인 데이터 저장
-            cur.execute(sql_highlight, (stream_id, timeline_json))
+            cur.execute(sql_highlight, (stream_id, duration_sec, 0, timeline_json))
 
             # 3. highlight_segments 구간 데이터 저장
             cur.execute(sql_delete_segments, (stream_id,))
