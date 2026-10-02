@@ -62,7 +62,7 @@ def fetch_live_streams(mode: str = "short"):
     logger.info(f"[{mode.upper()} 모드] 총 {len(streams)}건의 방송 데이터 수집 완료")
     return streams
 
-def process_and_save_streams(streams):
+def process_and_save_streams(streams, mode: str = "short"):
     if not streams:
         return
 
@@ -148,7 +148,47 @@ def process_and_save_streams(streams):
             # 스트림 배치 등록
             if stream_tuples:
                 execute_values(cur, stream_upsert_sql, stream_tuples, page_size=200)
-                
+
+            # 방송 종료 감지 및 하이라이트 태스크 생성
+            active_ids = [s[0] for s in stream_tuples]
+            if active_ids:
+                if mode == "short":
+                    update_ended_sql = """
+                        UPDATE oshilive.streams 
+                        SET status = 'past', 
+                            end_actual = COALESCE(end_actual, CURRENT_TIMESTAMP),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE status IN ('live', 'upcoming') 
+                          AND (start_scheduled IS NULL OR start_scheduled <= CURRENT_TIMESTAMP + INTERVAL '24 hours')
+                          AND NOT (stream_id = ANY(%s))
+                        RETURNING stream_id, topic_id, COALESCE(current_viewers, 0);
+                    """
+                else:
+                    update_ended_sql = """
+                        UPDATE oshilive.streams 
+                        SET status = 'past', 
+                            end_actual = COALESCE(end_actual, CURRENT_TIMESTAMP),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE status IN ('live', 'upcoming') 
+                          AND NOT (stream_id = ANY(%s))
+                        RETURNING stream_id, topic_id, COALESCE(current_viewers, 0);
+                    """
+                cur.execute(update_ended_sql, (active_ids,))
+                just_ended_streams = cur.fetchall()
+
+                if just_ended_streams:
+                    queue_values = [
+                        (row[0], 0) for row in just_ended_streams 
+                        if row[1] != 'membersonly' and (row[2] or 0) > 0
+                    ]
+                    if queue_values:
+                        queue_query = """
+                            INSERT INTO oshilive.highlight_batch_tasks (stream_id, status)
+                            VALUES %s ON CONFLICT (stream_id) DO NOTHING;
+                        """
+                        execute_values(cur, queue_query, queue_values)
+                        logger.info(f" └─ 하이라이트 대기열 {len(queue_values)}건 등록 완료 (회원 전용 제외)")
+
         logger.info(f"✅ 방송 데이터 총 {len(stream_tuples)}건 DB 동기화 완료!")
     except Exception as e:
         logger.error(f"❌ 방송 데이터 DB 저장 실패: {e}")
@@ -158,7 +198,7 @@ def run_live_sync(mode: str):
     logger.info(f"=== 실시간 방송 동기화 배치 시작 ({mode.upper()} 모드) ===")
     try:
         streams = fetch_live_streams(mode)
-        process_and_save_streams(streams)
+        process_and_save_streams(streams, mode)
     finally:
         if 'streams' in locals():
             del streams
