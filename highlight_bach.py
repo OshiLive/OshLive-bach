@@ -143,6 +143,10 @@ class HighlightAnalyzer:
                     if not elapsed: continue
 
                     sec = self._parse_time(elapsed)
+                    # 방송 개시 전 대기실 채팅(음수 시간) 제외
+                    if sec < 0:
+                        continue
+
                     if sec > self.total_duration:
                         self.total_duration = sec
 
@@ -168,13 +172,17 @@ class HighlightAnalyzer:
 
     def _parse_time(self, elapsed_str):
         try:
-            parts = elapsed_str.split(':')
+            is_negative = elapsed_str.startswith('-')
+            clean_str = elapsed_str.lstrip('-')
+            parts = clean_str.split(':')
+            sec = 0
             if len(parts) == 3:
-                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             elif len(parts) == 2:
-                return int(parts[0]) * 60 + int(parts[1])
+                sec = int(parts[0]) * 60 + int(parts[1])
             elif len(parts) == 1:
-                return int(parts[0])
+                sec = int(parts[0])
+            return -sec if is_negative else sec
         except Exception:
             pass
         return 0
@@ -188,7 +196,6 @@ class HighlightAnalyzer:
             b = self.timeline_buckets[sec]
             timeline.append({
                 "time_sec": sec,
-                "timestamp_sec": sec,
                 "messages": b["messages"],
                 "score": round(b["score"], 2)
             })
@@ -202,15 +209,15 @@ class HighlightAnalyzer:
 
         selected_highlights = []
         for cand in candidates:
-            c_sec = cand["timestamp_sec"]
+            c_sec = cand["time_sec"]
             # 2분 이내 중복 하이라이트 필터링
-            if any(abs(c_sec - h["timestamp_sec"]) < 120 for h in selected_highlights):
+            if any(abs(c_sec - h["time_sec"]) < 120 for h in selected_highlights):
                 continue
             selected_highlights.append(cand)
             if len(selected_highlights) >= HIGHLIGHT_COUNT:
                 break
 
-        selected_highlights.sort(key=lambda x: x["timestamp_sec"])
+        selected_highlights.sort(key=lambda x: x["time_sec"])
         return {
             "duration_sec": max(self.total_duration, 0),
             "timeline": timeline,
