@@ -63,10 +63,10 @@ def process_and_save_channels(raw_channels):
         logger.warning("저장할 채널 데이터가 없습니다.")
         return
 
-    upsert_tuples = []
+    upsert_map = {}
     for item in raw_channels:
         c_id = item.get('id')
-        if not c_id:
+        if not c_id or c_id in upsert_map:
             continue
 
         banner = item.get('banner') or item.get('header')
@@ -78,7 +78,7 @@ def process_and_save_channels(raw_channels):
         video_count = int(item.get('video_count') or 0)
         published_at = item.get('published_at')
 
-        upsert_tuples.append((
+        upsert_map[c_id] = (
             c_id,
             item.get('name'),
             item.get('english_name'),
@@ -90,7 +90,9 @@ def process_and_save_channels(raw_channels):
             video_count,
             published_at,
             True  # is_active
-        ))
+        )
+
+    upsert_tuples = list(upsert_map.values())
 
     upsert_sql = """
     INSERT INTO oshilive.channels (

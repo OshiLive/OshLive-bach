@@ -67,8 +67,8 @@ def process_and_save_streams(streams):
         return
 
     # 1. 미등록 채널 선별 및 기본 채널 추가 (Foreign Key 위반 방지)
-    channel_tuples = []
-    stream_tuples = []
+    channel_map = {}
+    stream_map = {}
 
     for s in streams:
         channel_info = s.get('channel', {})
@@ -78,38 +78,40 @@ def process_and_save_streams(streams):
         if not ch_id or not stream_id:
             continue
 
-        # 채널 정보 튜플
-        channel_tuples.append((
-            ch_id,
-            channel_info.get('name'),
-            channel_info.get('english_name'),
-            channel_info.get('org'),
-            channel_info.get('photo'),
-            channel_info.get('twitter'),
-            True
-        ))
+        # 채널 정보 중복 제거 (dict 기반)
+        if ch_id not in channel_map:
+            channel_map[ch_id] = (
+                ch_id,
+                channel_info.get('name'),
+                channel_info.get('english_name'),
+                channel_info.get('org'),
+                channel_info.get('photo'),
+                channel_info.get('twitter'),
+                True
+            )
 
-        # 스트림 정보 튜플
-        # 시간 문자열 Null-safety 처리
-        start_scheduled = s.get('start_scheduled')
-        start_actual = s.get('start_actual')
-        end_actual = s.get('end_actual')
-        
-        live_viewers = int(s.get('live_viewers') or 0)
-        topic_id = s.get('topic_id')
+        # 스트림 정보 중복 제거 (dict 기반)
+        if stream_id not in stream_map:
+            start_scheduled = s.get('start_scheduled')
+            start_actual = s.get('start_actual')
+            end_actual = s.get('end_actual')
+            current_viewers = int(s.get('live_viewers') or 0)
+            topic_id = s.get('topic_id')
 
-        stream_tuples.append((
-            stream_id,
-            ch_id,
-            s.get('title'),
-            s.get('status'),
-            s.get('type'),
-            topic_id,
-            start_scheduled,
-            start_actual,
-            end_actual,
-            live_viewers
-        ))
+            stream_map[stream_id] = (
+                stream_id,
+                ch_id,
+                s.get('title'),
+                s.get('status'),
+                topic_id,
+                start_scheduled,
+                start_actual,
+                end_actual,
+                current_viewers
+            )
+
+    channel_tuples = list(channel_map.values())
+    stream_tuples = list(stream_map.values())
 
     channel_upsert_sql = """
     INSERT INTO oshilive.channels (channel_id, name, english_name, org, profile_img_url, twitter_id, is_active)
@@ -124,18 +126,17 @@ def process_and_save_streams(streams):
 
     stream_upsert_sql = """
     INSERT INTO oshilive.streams (
-        stream_id, channel_id, title, status, type, topic_id,
-        start_scheduled, start_actual, end_actual, live_viewers
+        stream_id, channel_id, title, status, topic_id,
+        start_scheduled, start_actual, end_actual, current_viewers
     ) VALUES %s
     ON CONFLICT (stream_id) DO UPDATE SET
         title = EXCLUDED.title,
         status = EXCLUDED.status,
-        type = EXCLUDED.type,
         topic_id = COALESCE(EXCLUDED.topic_id, oshilive.streams.topic_id),
         start_scheduled = COALESCE(EXCLUDED.start_scheduled, oshilive.streams.start_scheduled),
         start_actual = COALESCE(EXCLUDED.start_actual, oshilive.streams.start_actual),
         end_actual = COALESCE(EXCLUDED.end_actual, oshilive.streams.end_actual),
-        live_viewers = EXCLUDED.live_viewers,
+        current_viewers = EXCLUDED.current_viewers,
         updated_at = CURRENT_TIMESTAMP;
     """
 
