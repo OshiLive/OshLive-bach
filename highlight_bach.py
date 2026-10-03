@@ -1,6 +1,7 @@
 import gc
 import json
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor
 import pytchat
 from pytchat.exceptions import ChatDataFinished
@@ -159,17 +160,26 @@ class HighlightAnalyzer:
                         self.total_duration = sec
 
                     score = 1.0
+                    kw_score = 0.0
                     if msg:
                         for kw, weight in KEYWORDS.items():
                             if kw in msg:
-                                score += weight
+                                kw_score += weight
+                        
+                        # 이모지(유니코드 이모지 및 유튜브 커스텀 이모지 :name:) 가중치
+                        emojis = re.findall(r'[\U00010000-\U0010ffff]|:[a-zA-Z0-9_]+:', msg)
+                        if emojis:
+                            kw_score += 0.5 * len(emojis)
+
+                    score += kw_score
 
                     bucket_sec = (sec // 30) * 30
                     if bucket_sec not in self.timeline_buckets:
-                        self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0}
+                        self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0, "keyword_score": 0.0}
 
                     self.timeline_buckets[bucket_sec]["messages"] += 1
                     self.timeline_buckets[bucket_sec]["score"] += score
+                    self.timeline_buckets[bucket_sec]["keyword_score"] += kw_score
 
         finally:
             if chat:
@@ -208,16 +218,36 @@ class HighlightAnalyzer:
             timeline.append({
                 "time_sec": sec,
                 "messages": b["messages"],
-                "score": round(b["score"], 2)
+                "score": round(b["score"], 2),
+                "keyword_score": round(b.get("keyword_score", 0.0), 2)
             })
 
-        scores = [b["score"] for b in self.timeline_buckets.values()]
-        avg_score = sum(scores) / len(scores) if scores else 0
-        threshold = max(avg_score * THRESHOLD_MULTIPLIER, 5.0)
+        # 1. 방송 시작 5분, 종료 5분 제외 (최소 방송길이가 15분 이상일 때만 적용하여 앞뒤 인사 제외)
+        valid_timeline = timeline
+        if self.total_duration > 900:
+            valid_timeline = [t for t in timeline if 300 <= t["time_sec"] <= self.total_duration - 300]
+        
+        if not valid_timeline:
+            valid_timeline = timeline
 
-        candidates = [t for t in timeline if t["score"] >= threshold]
-        candidates.sort(key=lambda x: x["score"], reverse=True)
+        # 2. 채팅량(messages) 기준 평균 계산
+        msg_counts = [t["messages"] for t in valid_timeline]
+        avg_msg = sum(msg_counts) / len(msg_counts) if msg_counts else 0
 
+        # 3. 급격히 치솟은 구간 (평균의 1.5배 이상) 찾기
+        spikes = [t for t in valid_timeline if t["messages"] >= avg_msg * 1.5]
+
+        candidates = []
+        if len(spikes) >= HIGHLIGHT_COUNT:
+            # 스파이크가 5개 이상이면, 키워드+이모지 점수(keyword_score)가 높은 순으로 정렬하여 엑기스 추출
+            spikes.sort(key=lambda x: x["keyword_score"], reverse=True)
+            candidates = spikes
+        else:
+            # 스파이크가 부족하면, 단순히 채팅량(messages)이 가장 많은 순으로 랭킹 매김
+            valid_timeline.sort(key=lambda x: x["messages"], reverse=True)
+            candidates = valid_timeline
+
+        # 4. 2분 이내 중복 필터링하며 상위 N개 추출
         selected_highlights = []
         for cand in candidates:
             c_sec = cand["time_sec"]
