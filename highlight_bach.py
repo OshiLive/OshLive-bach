@@ -32,8 +32,7 @@ KEYWORDS = {
     "????": 1.5,
     "かわいい": 1.0,
     "てぇてぇ": 1.5,
-    "たすかる": 1.5,
-    "神": 2.0
+    "たすかる": 1.5
 }
 
 # ==========================================
@@ -173,13 +172,19 @@ class HighlightAnalyzer:
 
                     score += kw_score
 
-                    bucket_sec = (sec // 30) * 30
+                    bucket_sec = (sec // 60) * 60
                     if bucket_sec not in self.timeline_buckets:
-                        self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0, "keyword_score": 0.0}
+                        self.timeline_buckets[bucket_sec] = {"messages": 0, "score": 0.0, "keyword_score": 0.0, "chat_map": {}}
 
                     self.timeline_buckets[bucket_sec]["messages"] += 1
                     self.timeline_buckets[bucket_sec]["score"] += score
                     self.timeline_buckets[bucket_sec]["keyword_score"] += kw_score
+
+                    # 동적 맵 수집 (군중 심리/도배 감지용, 1GB RAM 방어 위해 30자 이하 짧은 텍스트만)
+                    clean_msg = msg.strip().lower()
+                    if clean_msg and len(clean_msg) <= 30:
+                        chat_map = self.timeline_buckets[bucket_sec]["chat_map"]
+                        chat_map[clean_msg] = chat_map.get(clean_msg, 0) + 1
 
         finally:
             if chat:
@@ -215,11 +220,27 @@ class HighlightAnalyzer:
         timeline = []
         for sec in sorted(self.timeline_buckets.keys()):
             b = self.timeline_buckets[sec]
+            msg_count = b["messages"]
+            chat_map = b.get("chat_map", {})
+            
+            # 동적 밈(Meme) / 도배 가중치 계산
+            meme_bonus = 0.0
+            if msg_count >= 10:  # 채팅이 최소 10개 이상 모인 1분 구간
+                for text, count in chat_map.items():
+                    # 똑같은 채팅이 1분 내에 5번 이상 겹치거나, 전체의 15% 이상 차지하면 단결력 폭발!
+                    if count >= 5 or (count / msg_count) >= 0.15:
+                        meme_bonus += (count * 2.0)  # 군중심리 강력한 가중치(+2.0) 추가
+
+            final_keyword_score = round(b.get("keyword_score", 0.0) + meme_bonus, 2)
+
+            # 1GB RAM 방어를 위한 Map 즉시 폐기 (가비지 컬렉터로 반환)
+            b.pop("chat_map", None)
+
             timeline.append({
                 "time_sec": sec,
-                "messages": b["messages"],
+                "messages": msg_count,
                 "score": round(b["score"], 2),
-                "keyword_score": round(b.get("keyword_score", 0.0), 2)
+                "keyword_score": final_keyword_score
             })
 
         # 1. 방송 시작 5분, 종료 5분 제외 (최소 방송길이가 15분 이상일 때만 적용하여 앞뒤 인사 제외)
@@ -346,7 +367,7 @@ def complete_task(stream_id, result_json):
             cur.execute(sql_delete_segments, (stream_id,))
             for h in highlights:
                 start_sec = h.get("time_sec", 0)
-                end_sec = start_sec + 30
+                end_sec = start_sec + 60
                 cur.execute(sql_insert_segment, (stream_id, start_sec, end_sec))
 
         logger.info(f"✅ 스트림 [{stream_id}] 분석 완료 및 stream_highlights / segments DB 저장 성공! (하이라이트 {len(highlights)}개)")
