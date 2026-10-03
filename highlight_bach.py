@@ -315,7 +315,7 @@ def complete_task(stream_id, result_json):
             # 3. highlight_segments 구간 데이터 저장
             cur.execute(sql_delete_segments, (stream_id,))
             for h in highlights:
-                start_sec = h.get("timestamp_sec", 0)
+                start_sec = h.get("time_sec", 0)
                 end_sec = start_sec + 30
                 cur.execute(sql_insert_segment, (stream_id, start_sec, end_sec))
 
