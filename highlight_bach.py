@@ -195,7 +195,7 @@ class HighlightAnalyzer:
         for sec in sorted(self.timeline_buckets.keys()):
             b = self.timeline_buckets[sec]
             timeline.append({
-                "timestamp_sec": sec,
+                "time_sec": sec,
                 "messages": b["messages"],
                 "score": round(b["score"], 2)
             })
