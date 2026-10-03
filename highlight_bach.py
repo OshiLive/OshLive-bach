@@ -105,25 +105,31 @@ class HighlightAnalyzer:
                     data = chat.get()
                     if data is None:
                         empty_retry += 1
-                        if empty_retry >= 20:
-                            logger.warning(f"[{self.stream_id}] 20회 연속 빈 데이터로 조기 종료")
-                            break
-                        time.sleep(5)
+                        if empty_retry >= 30:
+                            if self.msg_count == 0:
+                                raise RuntimeError("YouTube 채팅 Replay 데이터가 아직 준비되지 않음 (0건 수집)")
+                            else:
+                                logger.info(f"[{self.stream_id}] 채팅 수집 완료 (이후 연속 빈 데이터)")
+                                break
+                        time.sleep(2)
                         continue
 
                     items = data.items
                     if not items:
                         empty_retry += 1
-                        if empty_retry >= 20:
-                            logger.warning(f"[{self.stream_id}] 20회 연속 데이터 없음으로 조기 종료")
-                            break
-                        time.sleep(5)
+                        if empty_retry >= 30:
+                            if self.msg_count == 0:
+                                raise RuntimeError("YouTube 채팅 Replay 데이터가 아직 준비되지 않음 (0건 수집)")
+                            else:
+                                logger.info(f"[{self.stream_id}] 채팅 수집 완료 (이후 연속 빈 데이터)")
+                                break
+                        time.sleep(2)
                         continue
                 except ChatDataFinished:
                     logger.info(f"[{self.stream_id}] 채팅 수집 정상 완료 (ChatDataFinished)")
                     break
                 except Exception as e:
-                    time.sleep(5)
+                    time.sleep(3)
                     if chat:
                         try: chat.terminate()
                         except: pass
@@ -147,6 +153,8 @@ class HighlightAnalyzer:
                     if sec < 0:
                         continue
 
+                    self.msg_count += 1
+
                     if sec > self.total_duration:
                         self.total_duration = sec
 
@@ -167,6 +175,9 @@ class HighlightAnalyzer:
             if chat:
                 try: chat.terminate()
                 except: pass
+
+        if self.msg_count == 0:
+            raise RuntimeError(f"[{self.stream_id}] 수집된 채팅 메시지가 0건입니다. (Replay 인코딩 처리 대기 필요)")
 
         return self.calculate_highlights()
 
@@ -234,7 +245,7 @@ STATUS_IN_PROGRESS = 2
 STATUS_FAILED = 3
 
 def fetch_pending_task():
-    """상태가 PENDING(0)인 가장 오래된 태스크 1건 점유 (FOR UPDATE SKIP LOCKED)"""
+    """상태가 PENDING(0)인 가장 오래된 태스크 1건 점유 (재시도 건은 최소 10분 쿨다운 적용)"""
     sql = """
     UPDATE oshilive.highlight_batch_tasks
     SET status = 2,
@@ -244,6 +255,7 @@ def fetch_pending_task():
         SELECT stream_id
         FROM oshilive.highlight_batch_tasks
         WHERE status = 0
+          AND (retry_count = 0 OR updated_at <= CURRENT_TIMESTAMP - INTERVAL '10 minutes')
         ORDER BY created_at ASC
         LIMIT 1
         FOR UPDATE SKIP LOCKED
@@ -363,7 +375,7 @@ def worker_process():
         except Exception as e:
             err_msg = str(e)
             logger.error(f"❌ 분석 실패 [Stream: {stream_id}]: {err_msg}")
-            if retry_count >= 3:
+            if retry_count >= 4:
                 fail_task(stream_id, f"Max retries ({retry_count}) exceeded: {err_msg}")
             else:
                 retry_task(stream_id, f"Attempt {retry_count} failed: {err_msg}")
