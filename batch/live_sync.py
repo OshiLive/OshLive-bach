@@ -97,6 +97,7 @@ def process_and_save_streams(streams, mode: str = "short"):
             end_actual = s.get('end_actual')
             current_viewers = int(s.get('live_viewers') or 0)
             topic_id = s.get('topic_id')
+            thumbnail_url = s.get('thumbnail') or f"https://i.ytimg.com/vi/{stream_id}/hqdefault.jpg"
 
             stream_map[stream_id] = (
                 stream_id,
@@ -107,7 +108,8 @@ def process_and_save_streams(streams, mode: str = "short"):
                 start_scheduled,
                 start_actual,
                 end_actual,
-                current_viewers
+                current_viewers,
+                thumbnail_url
             )
 
     channel_tuples = list(channel_map.values())
@@ -127,7 +129,7 @@ def process_and_save_streams(streams, mode: str = "short"):
     stream_upsert_sql = """
     INSERT INTO oshilive.streams (
         stream_id, channel_id, title, status, topic_id,
-        start_scheduled, start_actual, end_actual, current_viewers
+        start_scheduled, start_actual, end_actual, current_viewers, thumbnail_url
     ) VALUES %s
     ON CONFLICT (stream_id) DO UPDATE SET
         title = EXCLUDED.title,
@@ -137,6 +139,7 @@ def process_and_save_streams(streams, mode: str = "short"):
         start_actual = COALESCE(EXCLUDED.start_actual, oshilive.streams.start_actual),
         end_actual = COALESCE(EXCLUDED.end_actual, oshilive.streams.end_actual),
         current_viewers = EXCLUDED.current_viewers,
+        thumbnail_url = EXCLUDED.thumbnail_url,
         updated_at = CURRENT_TIMESTAMP;
     """
 
